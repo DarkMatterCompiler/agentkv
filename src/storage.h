@@ -11,7 +11,7 @@ constexpr uint64_t NULL_OFFSET = 0;
 // -----------------------------------------------------------------------------
 struct alignas(PAGE_SIZE) StorageHeader {
     uint32_t magic = 0x41474B56; 
-    uint32_t version = 1;
+    uint32_t version = 2;        // v0.2
     std::atomic<uint64_t> write_head;
     std::atomic<uint64_t> capacity;
     std::atomic<uint32_t> active_readers;
@@ -23,15 +23,13 @@ struct alignas(PAGE_SIZE) StorageHeader {
     uint32_t ef_construction;               // Config: Beam width during build
 
     // Padding Calculation:
-    // Previous used: 28 bytes.
-    // New fields: 8 + 4 + 4 + 4 = 20 bytes.
-    // Total used: 48 bytes.
-    // Padding needed to reach next PAGE_SIZE boundary
+    // 4+4+8+8+4 + 8+4+4+4 = 48 bytes used.
+    // Padding to next PAGE_SIZE boundary.
     uint8_t _pad[PAGE_SIZE - 48]; 
 };
 
 // -----------------------------------------------------------------------------
-// Vector & Edge Structures (Unchanged)
+// Vector & Edge Structures
 // -----------------------------------------------------------------------------
 struct alignas(64) VectorBlock {
     uint32_t dim;
@@ -52,6 +50,15 @@ struct EdgeList {
 };
 
 // -----------------------------------------------------------------------------
+// String Arena
+// -----------------------------------------------------------------------------
+struct alignas(8) StringBlock {
+    uint32_t length;        // Byte count (excluding null terminator)
+    uint32_t _pad;          // Explicit padding for 8-byte alignment
+    char data[0];           // Flexible array, null-terminated UTF-8
+};
+
+// -----------------------------------------------------------------------------
 // HNSW Node Topology
 // -----------------------------------------------------------------------------
 // This struct sits separately from the Node to keep Node small.
@@ -63,7 +70,7 @@ struct HNSWNodeData {
 };
 
 // -----------------------------------------------------------------------------
-// The Node (Updated)
+// The Node (v0.2)
 // -----------------------------------------------------------------------------
 struct alignas(CACHE_LINE) Node {
     uint64_t id;             
@@ -72,17 +79,19 @@ struct alignas(CACHE_LINE) Node {
     std::atomic<uint64_t> edge_list_head; // Semantic Graph (Knowledge)
     uint64_t vector_head;                 // Vector Data
     
-    // --- NEW: HNSW Index Pointer ---
-    // Points to HNSWNodeData struct
+    // HNSW Index Pointer — points to HNSWNodeData struct
     std::atomic<uint64_t> hnsw_head;      
 
     std::atomic<uint64_t> version_lock;
 
+    // String Arena pointer — offset to StringBlock
+    uint64_t text_offset;
+
     // Padding Calculation:
-    // 8 (id) + 8 (ts) + 8 (edge) + 8 (vec) + 8 (hnsw) + 8 (lock) = 48 bytes.
+    // 8 (id) + 8 (ts) + 8 (edge) + 8 (vec) + 8 (hnsw) + 8 (lock) + 8 (text) = 56 bytes.
     // Need 64 bytes total.
-    // Padding = 64 - 48 = 16 bytes.
-    uint8_t _pad[16]; 
+    // Padding = 64 - 56 = 8 bytes.
+    uint8_t _pad[8]; 
 };
 
 static_assert(sizeof(StorageHeader) % PAGE_SIZE == 0, "Header must be page-aligned");

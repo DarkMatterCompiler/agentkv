@@ -85,9 +85,10 @@ class AgentKVStore(BaseStore):
                 # Format as LangGraph Results
                 search_results = []
                 for offset in context_offsets:
+                    text = self.kv.get_text(offset)
                     search_results.append({
                         "key": str(offset),
-                        "value": {"offset": offset},
+                        "value": {"offset": offset, "text": text},
                         "score": 1.0 # Placeholder
                     })
                 results.append(search_results)
