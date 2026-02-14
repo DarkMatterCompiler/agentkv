@@ -1,0 +1,50 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+_skbuild/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+*.dll
+venv/
+env/
+ENV/
+
+# C++ compiled
+*.o
+*.a
+*.so.*
+*.dylib.*
+
+# Database files
+*.db
+agent_memory*.db
+brain.db
+
+# Test artifacts
+test_size
+test_node_size
+test_header
+*.cpp.o
+*.cpp.o.d
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.log
