@@ -7,7 +7,7 @@ from .context import ContextBuilder
 
 class AgentKV:
     """
-    The Main Cockpit — v0.5
+    The Main Cockpit — v0.6
     Manages the Memory-Mapped Engine, Semantic Lookaside Buffer,
     HNSW Vector Index (dynamic insert), String Arena, and Context Assembly.
     """
@@ -87,7 +87,7 @@ class AgentKV:
 
 
 # Export core classes
-__version__ = "0.3.0"
+__version__ = "0.7.1"
 __all__ = [
     "AgentKV", "ContextBuilder", "KVEngine", "ContextManager",
 ]

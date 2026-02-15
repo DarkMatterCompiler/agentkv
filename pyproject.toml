@@ -1,14 +1,73 @@
 [build-system]
-requires = ["scikit-build-core", "nanobind"]
+requires = ["scikit-build-core>=0.5", "nanobind>=1.5"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "agentkv"
-version = "0.5.0"
-description = "Zero-Copy Memory-Mapped Graph Memory for Agents"
-requires-python = ">=3.8"
-dependencies = ["numpy"]
+version = "0.7.1"
+description = "The SQLite of agent memory — embeddable vector + graph store for AI agents"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "AgentKV Contributors"},
+]
+keywords = ["vector-database", "agent-memory", "hnsw", "mmap", "rag", "llm", "embeddings"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+ollama = ["requests>=2.25"]
+search = ["ddgs>=6.0"]
+all = ["requests>=2.25", "ddgs>=6.0"]
+dev = [
+    "pytest>=7.0",
+    "faiss-cpu>=1.7",
+    "chromadb>=0.4",
+    "requests>=2.25",
+    "ddgs>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/DarkMatterCompiler/agentkv"
+Repository = "https://github.com/DarkMatterCompiler/agentkv"
+Documentation = "https://github.com/DarkMatterCompiler/agentkv#readme"
+Issues = "https://github.com/DarkMatterCompiler/agentkv/issues"
 
 [tool.scikit-build]
 cmake.verbose = true
 wheel.packages = ["agentkv"]
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+CMAKE_BUILD_TYPE = "Release"
+
+# --- cibuildwheel configuration for binary wheels ---
+[tool.cibuildwheel]
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip = "*-win32 *-manylinux_i686 *-musllinux*"
+test-requires = ["pytest", "numpy"]
+test-command = "python -c \"import agentkv; print(agentkv.__version__)\""
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+before-build = "pip install scikit-build-core nanobind numpy"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+before-build = "pip install scikit-build-core nanobind numpy"

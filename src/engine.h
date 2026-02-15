@@ -4,6 +4,42 @@
 #include <vector>
 #include <random>
 #include <utility>
+#include <shared_mutex>
+#include <cstdint>
+#include <cstddef>
+#include <sys/mman.h>
+
+// Simple CRC-32 (ISO 3309 polynomial)
+inline uint32_t crc32_compute(const void* data, size_t length) {
+    const uint8_t* buf = static_cast<const uint8_t*>(data);
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= buf[i];
+        for (int j = 0; j < 8; ++j)
+            crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+    }
+    return ~crc;
+}
+
+// RAII Read Lock Guard
+class ReadGuard {
+    std::shared_mutex& mtx_;
+public:
+    explicit ReadGuard(std::shared_mutex& m) : mtx_(m) { mtx_.lock_shared(); }
+    ~ReadGuard() { mtx_.unlock_shared(); }
+    ReadGuard(const ReadGuard&) = delete;
+    ReadGuard& operator=(const ReadGuard&) = delete;
+};
+
+// RAII Write Lock Guard
+class WriteGuard {
+    std::shared_mutex& mtx_;
+public:
+    explicit WriteGuard(std::shared_mutex& m) : mtx_(m) { mtx_.lock(); }
+    ~WriteGuard() { mtx_.unlock(); }
+    WriteGuard(const WriteGuard&) = delete;
+    WriteGuard& operator=(const WriteGuard&) = delete;
+};
 
 class KVEngine {
 private:
@@ -12,11 +48,24 @@ private:
     StorageHeader* header;
     std::string filepath;
     std::mt19937 rng;
+    mutable std::shared_mutex rwlock_;  // 1 writer + N readers
 
     // Internal Helpers
     template <typename T> T* get_ptr(uint64_t offset);
     uint64_t allocate(uint64_t size, uint64_t alignment);
     int get_random_level();
+
+    // Crash Recovery Helpers
+    void checkpoint_header();      // Save known-good state before mutation
+    void update_header_checksum(); // Recompute CRC-32 over header
+    bool validate_header();        // Check magic + checksum
+    void recover_if_needed();      // Rollback to safe state on dirty open
+    bool validate_header_const() const {
+        if (header->magic != AGENTKV_MAGIC) return false;
+        size_t checksum_offset = offsetof(StorageHeader, checksum);
+        uint32_t expected = crc32_compute(header, checksum_offset);
+        return header->checksum == expected;
+    }
 
     // HNSW Internal
     // Returns raw dot product (higher = more similar)
@@ -42,6 +91,10 @@ public:
     void add_edge(uint64_t node_offset, uint64_t target_id, float weight);
     void print_node(uint64_t offset);
 
+    // Crash Recovery API
+    bool is_valid() const { return validate_header_const(); }
+    void sync() { msync(map_base, header->capacity, MS_SYNC); }
+
     // String Arena API
     uint64_t store_text(const std::string& text);
     // Returns {pointer_to_char_data, length}. Pointer into mmap.
@@ -51,10 +104,11 @@ public:
     void init_hnsw(uint64_t node_offset);
     void add_hnsw_link(uint64_t node_offset, int layer, uint64_t target_offset, float dist);
     // K-NN search: returns vector of (node_offset, distance) sorted ascending by distance
+    // Thread-safe: acquires read lock.
     std::vector<std::pair<uint64_t, float>> search_knn(
         const float* query, uint32_t dim, int k, int ef_search = 50);
     // Dynamic HNSW insertion: creates node, assigns level, wires bidirectional links.
-    // Returns the node offset.
+    // Thread-safe: acquires write lock. Returns the node offset.
     uint64_t insert(uint64_t id, const std::vector<float>& embedding,
                     const std::string& text = "");
 

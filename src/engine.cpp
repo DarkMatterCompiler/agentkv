@@ -11,11 +11,11 @@
 #include <unordered_set>
 
 // =============================================================================
-// Constructor
+// Constructor — with crash recovery
 // =============================================================================
 KVEngine::KVEngine(const std::string& path, size_t size_bytes) : filepath(path) {
     fd = open(path.c_str(), O_RDWR | O_CREAT, 0666);
-    if (fd == -1) throw std::runtime_error("Failed to open file");
+    if (fd == -1) throw std::runtime_error("Failed to open file: " + path);
     if (ftruncate(fd, size_bytes) == -1) throw std::runtime_error("Resize failed");
     map_base = mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map_base == MAP_FAILED) throw std::runtime_error("mmap failed");
@@ -26,26 +26,107 @@ KVEngine::KVEngine(const std::string& path, size_t size_bytes) : filepath(path) 
     std::random_device rd;
     rng = std::mt19937(rd());
     
-    if (header->magic != 0x41474B56) {
-        header->magic = 0x41474B56;
-        header->version = 2;
+    if (header->magic != AGENTKV_MAGIC) {
+        // --- Fresh database: zero header then initialize ---
+        std::memset(header, 0, sizeof(StorageHeader));
+        header->magic = AGENTKV_MAGIC;
+        header->version = AGENTKV_VERSION;
         header->write_head = sizeof(StorageHeader); 
         header->capacity = size_bytes;
         
-        // Initialize HNSW Defaults
+        // HNSW defaults
         header->hnsw_entry_point = NULL_OFFSET;
         header->hnsw_max_level = -1;
-        header->M_max = 16;           // Default 16 neighbors
+        header->M_max = 16;
         header->ef_construction = 100;
+
+        // Recovery fields
+        header->flags = FLAG_CLEAN_SHUTDOWN;
+        header->safe_write_head = sizeof(StorageHeader);
+        header->safe_hnsw_entry_point = NULL_OFFSET;
+        header->safe_hnsw_max_level = -1;
+        header->_recovery_pad = 0;
+        
+        update_header_checksum();
+        msync(map_base, PAGE_SIZE, MS_SYNC);
+    } else {
+        // --- Existing database: check for crash recovery ---
+        recover_if_needed();
     }
+
+    // Mark as "open / not cleanly shut down"
+    header->flags &= ~FLAG_CLEAN_SHUTDOWN;
+    update_header_checksum();
+    msync(map_base, PAGE_SIZE, MS_SYNC);
 }
 
 // =============================================================================
-// Destructor
+// Destructor — clean shutdown with sync
 // =============================================================================
 KVEngine::~KVEngine() {
+    // Mark clean shutdown
+    header->flags |= FLAG_CLEAN_SHUTDOWN;
+    header->flags &= ~FLAG_WRITE_IN_PROGRESS;
+    checkpoint_header();
+    update_header_checksum();
+    msync(map_base, header->capacity, MS_SYNC);
     munmap(map_base, header->capacity);
     close(fd);
+}
+
+// =============================================================================
+// Crash Recovery: Checkpoint — save known-good state before mutation
+// =============================================================================
+void KVEngine::checkpoint_header() {
+    header->safe_write_head = header->write_head.load();
+    header->safe_hnsw_entry_point = header->hnsw_entry_point.load();
+    header->safe_hnsw_max_level = header->hnsw_max_level.load();
+}
+
+// =============================================================================
+// Crash Recovery: CRC-32 checksum over header (excluding checksum + pad)
+// =============================================================================
+void KVEngine::update_header_checksum() {
+    // Checksum covers bytes [0, offset_of_checksum)
+    // checksum field is at offset 52 (after flags at 48 + 4 bytes)
+    size_t checksum_offset = offsetof(StorageHeader, checksum);
+    header->checksum = crc32_compute(header, checksum_offset);
+}
+
+// =============================================================================
+// Crash Recovery: Validate header integrity
+// =============================================================================
+bool KVEngine::validate_header() {
+    if (header->magic != AGENTKV_MAGIC) return false;
+    size_t checksum_offset = offsetof(StorageHeader, checksum);
+    uint32_t expected = crc32_compute(header, checksum_offset);
+    return header->checksum == expected;
+}
+
+// =============================================================================
+// Crash Recovery: Rollback to last-known-good state if dirty
+// =============================================================================
+void KVEngine::recover_if_needed() {
+    bool clean = (header->flags & FLAG_CLEAN_SHUTDOWN) != 0;
+    bool checksum_ok = validate_header();
+
+    if (clean && checksum_ok) {
+        return; // Normal reopen — nothing to do
+    }
+
+    // Dirty open or corrupted checksum: rollback to safe state
+    if (header->safe_write_head >= sizeof(StorageHeader) &&
+        header->safe_write_head <= header->capacity.load()) {
+        header->write_head.store(header->safe_write_head);
+    }
+    if (header->safe_hnsw_entry_point != NULL_OFFSET) {
+        header->hnsw_entry_point.store(header->safe_hnsw_entry_point);
+        header->hnsw_max_level.store(header->safe_hnsw_max_level);
+    }
+
+    header->flags &= ~FLAG_WRITE_IN_PROGRESS;
+    update_header_checksum();
+    msync(map_base, PAGE_SIZE, MS_SYNC);
 }
 
 // =============================================================================
@@ -410,6 +491,8 @@ std::vector<std::pair<float, uint64_t>> KVEngine::search_layer(
 std::vector<std::pair<uint64_t, float>> KVEngine::search_knn(
     const float* query, uint32_t dim, int k, int ef_search) 
 {
+    ReadGuard rg(rwlock_);  // N readers can search concurrently
+
     uint64_t ep = header->hnsw_entry_point.load();
     int max_level = header->hnsw_max_level.load();
     
@@ -461,6 +544,13 @@ std::vector<std::pair<float, uint64_t>> KVEngine::select_neighbors(
 uint64_t KVEngine::insert(uint64_t id, const std::vector<float>& embedding,
                           const std::string& text) 
 {
+    WriteGuard wg(rwlock_);  // Exclusive access during mutation
+
+    // --- Crash Recovery: checkpoint before mutation ---
+    checkpoint_header();
+    header->flags |= FLAG_WRITE_IN_PROGRESS;
+    msync(map_base, PAGE_SIZE, MS_SYNC);
+
     // 1. Create the node (vector + text + node struct)
     uint64_t new_offset = create_node(id, embedding, text);
     
@@ -490,6 +580,13 @@ uint64_t KVEngine::insert(uint64_t id, const std::vector<float>& embedding,
         // First node in the index
         header->hnsw_entry_point.store(new_offset);
         header->hnsw_max_level.store(new_level);
+
+        // --- Crash Recovery: commit (early return path) ---
+        header->flags &= ~FLAG_WRITE_IN_PROGRESS;
+        checkpoint_header();
+        update_header_checksum();
+        msync(map_base, PAGE_SIZE, MS_SYNC);
+
         return new_offset;
     }
 
@@ -538,6 +635,12 @@ uint64_t KVEngine::insert(uint64_t id, const std::vector<float>& embedding,
         header->hnsw_max_level.store(new_level);
         header->hnsw_entry_point.store(new_offset);
     }
+
+    // --- Crash Recovery: commit — mutation complete ---
+    header->flags &= ~FLAG_WRITE_IN_PROGRESS;
+    checkpoint_header();
+    update_header_checksum();
+    msync(map_base, PAGE_SIZE, MS_SYNC);
 
     return new_offset;
 }

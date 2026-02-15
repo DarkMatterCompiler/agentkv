@@ -20,6 +20,7 @@ ENV/
 *.a
 *.so.*
 *.dylib.*
+*.exe
 
 # Database files
 *.db

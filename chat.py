@@ -1,34 +1,39 @@
 """
-AgentKV Memory Chat — A CLI chatbot with persistent long-term memory.
+AgentKV Memory Chat v0.6 — CLI chatbot with persistent memory + web search.
 
 Architecture:
     User Input → Embed (Ollama nomic-embed-text)
-              → Search (AgentKV HNSW)
-              → Assemble Context (ContextBuilder)
+              → Search Memory (AgentKV HNSW)
+              → Assemble Context
               → Generate (Ollama llama3)
-              → Store Memory (AgentKV insert)
+              → [Tool Call?] → web_search → embed results → store in AgentKV
+              → Final Response
+              → Store Conversation as Memory
 
-Runs 100% locally. No cloud APIs.
+The agent autonomously decides when to search the web and stores
+new knowledge into AgentKV for future recall.
+
+Runs 100% locally. No cloud APIs (except DuckDuckGo for web search).
 """
 import sys
 import time
-import numpy as np
 from agentkv import AgentKV
 from agentkv.ollama import get_embedding, chat, is_available, list_models
+from agentkv.tools import web_search, format_search_results, TOOL_PROMPT, TOOL_CALL_PATTERN
 
 # --- Configuration ---
 DB_PATH = "memory.db"
 DB_SIZE_MB = 100
 DIM = 768            # nomic-embed-text dimension
 TOP_K = 3            # memories to retrieve per query
-CONTEXT_TOKENS = 1024
 CHAT_MODEL = "llama3"
 
-SYSTEM_PROMPT = """You are a helpful assistant with access to long-term memory.
+SYSTEM_PROMPT = """You are a helpful research assistant with long-term memory and web search.
 You remember previous conversations with the user.
-Use the context below to inform your answers. If the context is relevant, use it naturally.
-If the context is not relevant to the current question, ignore it and answer normally.
-Do NOT mention "context" or "memory retrieval" to the user — just answer naturally.
+Use the memory context below if relevant. If not relevant, ignore it.
+Do NOT mention "context", "memory retrieval", or "tool calls" to the user — just answer naturally.
+
+{tool_instructions}
 
 {context}"""
 
@@ -39,6 +44,43 @@ def format_context(memories: list[str]) -> str:
         return "No relevant memories found."
     parts = [f"- {mem}" for mem in memories]
     return "Relevant memories:\n" + "\n".join(parts)
+
+
+def handle_tool_call(response: str, db: AgentKV) -> tuple[bool, str, str]:
+    """
+    Check if the LLM wants to use a tool. If so, execute it and store results.
+    
+    Returns:
+        (tool_used, tool_output_for_llm, status_msg_for_user)
+    """
+    match = TOOL_CALL_PATTERN.search(response)
+    if not match:
+        return False, "", ""
+    
+    query = match.group(1)
+    print(f"  🔎 Searching web: \"{query}\"...")
+    
+    t0 = time.time()
+    results = web_search(query, max_results=5)
+    t_search = time.time() - t0
+    
+    # Format results for the LLM
+    formatted = format_search_results(results)
+    
+    # Store each search result as a memory in AgentKV
+    stored = 0
+    for r in results:
+        if r["snippet"] and r["title"] != "Search Error":
+            text = f"[Web] {r['title']}: {r['snippet']} (source: {r['url']})"
+            try:
+                vec = get_embedding(text)
+                db.add(text, vec)
+                stored += 1
+            except Exception:
+                pass
+    
+    status = f"  📥 {stored} results stored in memory ({t_search:.1f}s)"
+    return True, formatted, status
 
 
 def check_environment():
@@ -63,10 +105,10 @@ def check_environment():
 
 
 def main():
-    print("=" * 55)
-    print("  AgentKV Memory Chat v0.5")
-    print("  Persistent memory • Local LLM • Zero cloud")
-    print("=" * 55)
+    print("=" * 60)
+    print("  AgentKV Memory Chat v0.6")
+    print("  Persistent memory • Web search • Local LLM • Thread-safe")
+    print("=" * 60)
 
     # 1. Environment check
     check_environment()
@@ -77,12 +119,11 @@ def main():
     print("  ✅ Memory engine ready\n")
 
     # 3. Conversation state
-    # We keep a short rolling window for multi-turn coherence,
-    # but long-term memory lives in AgentKV.
     conversation: list[dict[str, str]] = []
     turn_count = 0
 
-    print("Type your message (or 'quit' to exit, 'recall' to see memory).\n")
+    print("Type your message (or 'quit' to exit, 'recall' to see memory).")
+    print("The assistant can search the web and remember results.\n")
 
     while True:
         try:
@@ -108,7 +149,7 @@ def main():
                 if results:
                     for offset, dist in results:
                         text = db.get_text(offset)
-                        print(f"  [{dist:.4f}] {text[:80]}...")
+                        print(f"  [{dist:.4f}] {text[:100]}...")
                 else:
                     print("  (empty)")
             else:
@@ -132,34 +173,49 @@ def main():
 
         # --- Step 3: Assemble context ---
         context_block = format_context(memory_texts)
-        system_msg = SYSTEM_PROMPT.format(context=context_block)
+        system_msg = SYSTEM_PROMPT.format(
+            tool_instructions=TOOL_PROMPT,
+            context=context_block,
+        )
 
         # Build messages: system + rolling conversation + current input
         messages = [{"role": "system", "content": system_msg}]
-
-        # Keep last 6 turns (3 user + 3 assistant) for coherence
         recent = conversation[-6:] if len(conversation) > 6 else conversation
         messages.extend(recent)
         messages.append({"role": "user", "content": user_input})
 
-        # --- Step 4: Generate response ---
+        # --- Step 4: Generate response (may include tool call) ---
         response = chat(messages, model=CHAT_MODEL)
+
+        # --- Step 5: Tool dispatch ---
+        tool_used, tool_output, tool_status = handle_tool_call(response, db)
+        
+        if tool_used:
+            print(tool_status)
+            
+            # Feed tool results back to the LLM for a final answer
+            messages.append({"role": "assistant", "content": response})
+            messages.append({
+                "role": "user",
+                "content": f"Here are the web search results:\n\n{tool_output}\n\n"
+                           f"Now answer the original question naturally using these results. "
+                           f"Do NOT use TOOL_CALL again."
+            })
+            response = chat(messages, model=CHAT_MODEL)
 
         t_elapsed = time.time() - t_start
 
-        # --- Step 5: Display ---
+        # --- Step 6: Display ---
+        tool_label = " + 🔎 web" if tool_used else ""
         print(f"\nAssistant: {response}")
-        print(f"  ⏱ {t_elapsed:.1f}s | 🧠 {len(memory_texts)} memories recalled\n")
+        print(f"  ⏱ {t_elapsed:.1f}s | 🧠 {len(memory_texts)} memories{tool_label}\n")
 
-        # --- Step 6: Store memories ---
-        # Store the user's message
+        # --- Step 7: Store memories ---
         db.add(f"User said: {user_input}", query_vec)
-
-        # Store the assistant's response (with its own embedding)
         resp_vec = get_embedding(response)
         db.add(f"Assistant said: {response}", resp_vec)
 
-        # --- Step 7: Update conversation window ---
+        # --- Step 8: Update conversation window ---
         conversation.append({"role": "user", "content": user_input})
         conversation.append({"role": "assistant", "content": response})
 

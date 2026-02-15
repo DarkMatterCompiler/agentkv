@@ -19,6 +19,7 @@ if(MSVC)
     target_compile_options(agentkv_core PRIVATE /O2 /std:c++20)
 else()
     target_compile_options(agentkv_core PRIVATE -O3 -std=c++20 -fPIC -march=native)
+    target_link_libraries(agentkv_core PRIVATE pthread)
 endif()
 
 # 5. Install the extension module at the wheel root (site-packages/)

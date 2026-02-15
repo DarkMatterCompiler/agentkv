@@ -77,7 +77,13 @@ NB_MODULE(agentkv_core, m) {
 
         // HNSW management (kept for backward compat / manual use)
         .def("init_hnsw", &KVEngine::init_hnsw)
-        .def("add_hnsw_link", &KVEngine::add_hnsw_link);
+        .def("add_hnsw_link", &KVEngine::add_hnsw_link)
+
+        // Crash recovery / validation
+        .def("is_valid", &KVEngine::is_valid,
+             "Check if the database header checksum is valid")
+        .def("sync", &KVEngine::sync,
+             "Force msync of the entire mmap to disk");
 
 
     // -------------------------------------------------------------------------
