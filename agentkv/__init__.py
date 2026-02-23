@@ -212,7 +212,7 @@ class AgentKV:
 
 
 # Export core classes
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 __all__ = [
     "AgentKV", "ContextBuilder", "KVEngine", "ContextManager",
     "COSINE", "L2", "INNER_PRODUCT",

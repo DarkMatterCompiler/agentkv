@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "agentkv"
-version = "0.9.0"
+version = "0.9.1"
 description = "The SQLite of agent memory — embeddable vector + graph store for AI agents"
 readme = "README.md"
 license = {text = "MIT"}
