@@ -36,6 +36,11 @@ import struct
 import gc
 import numpy as np
 
+# Windows console: force UTF-8 output
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # We need the C++ extension
@@ -74,6 +79,26 @@ def make_vec(seed, dim=DIM):
     return v
 
 
+def safe_remove(path):
+    """Remove a DB file.  On Windows the mmap handle may linger until GC runs,
+    so we force collection + retry before giving up."""
+    gc.collect()
+    for _ in range(5):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(0.1)
+    # Last resort — ignore on Windows
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except PermissionError:
+            pass
+
+
 # ─────────────────────────────────────────────────────
 # Test 1: Fresh DB creation + header validation
 # ─────────────────────────────────────────────────────
@@ -92,7 +117,7 @@ def test_fresh_db():
         del db2
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -120,7 +145,7 @@ def test_insert_search():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -154,7 +179,7 @@ def test_text_storage():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -198,7 +223,7 @@ def test_persistence():
         del db2
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -245,7 +270,7 @@ def test_crash_recovery():
         del db2
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -307,7 +332,7 @@ def test_concurrency():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -350,14 +375,15 @@ def test_scale():
         print(f"    Search: {search_time:.2f}s ({per_query:.0f} us/query)")
         print(f"    Recall@5: {recall:.1%} ({hits}/{total})")
 
-        check("Scale: insert reasonable", insert_per < 5000,
-              f"{insert_per:.0f} us/vec")
+        insert_limit = 10000 if sys.platform == "win32" else 5000
+        check("Scale: insert reasonable", insert_per < insert_limit,
+              f"{insert_per:.0f} us/vec (limit {insert_limit})")
         check("Scale: recall >= 80%", recall >= 0.80, f"{recall:.1%}")
 
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -384,20 +410,20 @@ def test_graph_slb():
         check("SLB returns context", len(ctx) >= 1, f"got {len(ctx)} nodes")
         # Verify B is actually in the returned context
         ctx_offsets_a = [c[0] if isinstance(c, tuple) else c for c in ctx]
-        check("SLB A→B: B in context", off_b in ctx_offsets_a,
+        check("SLB A->B: B in context", off_b in ctx_offsets_a,
               f"expected {off_b} in {ctx_offsets_a}")
 
         # Observe B — should predict C (via B->C edge)
         ctx2 = db.observe(off_b)
         check("SLB B->C", len(ctx2) >= 1, f"got {len(ctx2)} nodes")
         ctx_offsets_b = [c[0] if isinstance(c, tuple) else c for c in ctx2]
-        check("SLB B→C: C in context", off_c in ctx_offsets_b,
+        check("SLB B->C: C in context", off_c in ctx_offsets_b,
               f"expected {off_c} in {ctx_offsets_b}")
 
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -437,7 +463,7 @@ def test_api():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -447,7 +473,7 @@ def test_version():
     print("\n[Test 10] Version / package metadata")
     import agentkv
     check("Version defined", hasattr(agentkv, '__version__'))
-    check("Version is 0.7.1", agentkv.__version__ == "0.7.1",
+    check("Version is 0.9.0", agentkv.__version__ == "0.9.0",
           f"got '{agentkv.__version__}'")
     check("AgentKV exported", hasattr(agentkv, 'AgentKV'))
     check("KVEngine exported", hasattr(agentkv, 'KVEngine'))
@@ -502,7 +528,7 @@ def test_input_validation():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # =============================================================================
@@ -525,11 +551,11 @@ def test_error_handling():
 
         # Should create a fresh DB (magic mismatch → treat as new)
         db2 = AgentKV(path, size_mb=5, dim=DIM)
-        check("Bad magic → fresh DB", db2.engine.is_valid())
+        check("Bad magic -> fresh DB", db2.engine.is_valid())
         del db2
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
     # 12b. Corrupted checksum
     path2 = tempfile.mktemp(suffix=".db")
@@ -547,7 +573,7 @@ def test_error_handling():
 
         # Should recover to safe state
         db2 = AgentKV(path2, size_mb=5, dim=DIM)
-        check("Bad checksum → recovery", db2 is not None)
+        check("Bad checksum -> recovery", db2 is not None)
         check("Post-recovery valid", db2.engine.is_valid())
 
         # Verify data survived corruption recovery
@@ -562,7 +588,7 @@ def test_error_handling():
         del db2
     finally:
         if os.path.exists(path2):
-            os.remove(path2)
+            safe_remove(path2)
 
     # 12c. Truncated database file
     path3 = tempfile.mktemp(suffix=".db")
@@ -577,18 +603,18 @@ def test_error_handling():
         del db2
     finally:
         if os.path.exists(path3):
-            os.remove(path3)
+            safe_remove(path3)
 
     # 12d. Search on empty database
     path4 = tempfile.mktemp(suffix=".db")
     try:
         db = AgentKV(path4, size_mb=5, dim=DIM)
         results = db.search(make_vec(1240), k=5)
-        check("Empty DB search → []", len(results) == 0)
+        check("Empty DB search -> []", len(results) == 0)
         del db
     finally:
         if os.path.exists(path4):
-            os.remove(path4)
+            safe_remove(path4)
 
 
 # =============================================================================
@@ -692,7 +718,7 @@ def test_thread_safety():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # =============================================================================
@@ -713,7 +739,7 @@ def test_boundary_conditions():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
     # 14b. Database at capacity — tiny DB with many inserts
     path2 = tempfile.mktemp(suffix=".db")
@@ -735,7 +761,7 @@ def test_boundary_conditions():
         del db
     finally:
         if os.path.exists(path2):
-            os.remove(path2)
+            safe_remove(path2)
 
     # 14c. Maximum text length
     path3 = tempfile.mktemp(suffix=".db")
@@ -749,7 +775,7 @@ def test_boundary_conditions():
         del db
     finally:
         if os.path.exists(path3):
-            os.remove(path3)
+            safe_remove(path3)
 
 
 # =============================================================================
@@ -811,7 +837,7 @@ def test_data_correctness():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # =============================================================================
@@ -881,7 +907,7 @@ def test_graph_relations():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # =============================================================================
@@ -916,7 +942,7 @@ def test_memory_stress():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # =============================================================================
@@ -947,7 +973,7 @@ def test_multi_cycle_persistence():
             del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # =============================================================================
@@ -1001,7 +1027,7 @@ def test_recall_quality():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
 
 
 # =============================================================================
@@ -1067,7 +1093,984 @@ def test_api_completeness():
         del db
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 21: Batch Insert
+# =============================================================================
+def test_batch_insert():
+    print("\n[Test 21] Batch insert")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=10, dim=DIM)
+
+        N = 200
+        vecs = np.random.randn(N, DIM).astype(np.float32)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        texts = [f"batch_{i}" for i in range(N)]
+
+        t0 = time.time()
+        offsets = db.add_batch(texts, vecs)
+        batch_time = time.time() - t0
+
+        check("Batch: correct count", len(offsets) == N, f"got {len(offsets)}")
+        check("Batch: db.count", len(db) == N, f"got {len(db)}")
+
+        # Verify round-trip
+        check("Batch: text[0]", db.get_text(offsets[0]) == "batch_0")
+        check("Batch: text[-1]", db.get_text(offsets[-1]) == f"batch_{N-1}")
+
+        # Search should find the exact vector
+        results = db.search(vecs[42], k=1)
+        check("Batch: search finds exact", db.get_text(results[0][0]) == "batch_42",
+              f"got {db.get_text(results[0][0])}")
+
+        # Compare batch vs sequential speed
+        path2 = tempfile.mktemp(suffix=".db")
+        db2 = AgentKV(path2, size_mb=10, dim=DIM)
+        t1 = time.time()
+        for i in range(N):
+            db2.add(texts[i], vecs[i])
+        seq_time = time.time() - t1
+        del db2
+        safe_remove(path2)
+
+        speedup = seq_time / max(batch_time, 1e-9)
+        print(f"    Batch: {batch_time:.3f}s  Seq: {seq_time:.3f}s  Speedup: {speedup:.1f}x")
+        check("Batch: faster than sequential", speedup > 1.0,
+              f"speedup {speedup:.1f}x")
+
+        # Batch with metadata
+        metas = [{"src": "batch"} for _ in range(N)]
+        path3 = tempfile.mktemp(suffix=".db")
+        db3 = AgentKV(path3, size_mb=10, dim=DIM)
+        offsets3 = db3.add_batch(texts, vecs, metas)
+        check("Batch+meta: metadata set", db3.get_metadata(offsets3[0], "src") == "batch")
+        del db3
+        safe_remove(path3)
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 22: Delete / Update
+# =============================================================================
+def test_delete_update():
+    print("\n[Test 22] Delete / Update")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=10, dim=DIM)
+
+        v1 = make_vec(9001)
+        v2 = make_vec(9002)
+        v3 = make_vec(9003)
+
+        o1 = db.add("node_alpha", v1)
+        o2 = db.add("node_beta", v2)
+        o3 = db.add("node_gamma", v3)
+
+        check("Del: initial count", len(db) == 3)
+
+        # Delete one
+        db.delete(o2)
+        check("Del: count after delete", len(db) == 2)
+
+        # Search should not return deleted node
+        results = db.search(v2, k=3)
+        found_texts = [db.get_text(r[0]) for r in results]
+        check("Del: deleted node not in search", "node_beta" not in found_texts,
+              f"found: {found_texts}")
+
+        # Double-delete should be safe
+        db.delete(o2)
+        check("Del: double-delete safe", len(db) == 2)
+
+        # Update = tombstone + re-insert
+        v_new = make_vec(9999)
+        o_new = db.update(o1, "node_alpha_v2", v_new)
+        check("Update: new offset differs", o_new != o1)
+        check("Update: old text gone from search",
+              "node_alpha" not in [db.get_text(r[0]) for r in db.search(v1, k=5)])
+        check("Update: new text found",
+              db.get_text(o_new) == "node_alpha_v2")
+        check("Update: count unchanged", len(db) == 2)
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 23: Metadata Filtering
+# =============================================================================
+def test_metadata_filtering():
+    print("\n[Test 23] Metadata filtering")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=10, dim=DIM)
+
+        # Insert nodes with different categories
+        categories = ["science", "history", "science", "art", "history",
+                       "science", "art", "science", "history", "art"]
+        offsets = []
+        for i, cat in enumerate(categories):
+            v = make_vec(5000 + i)
+            o = db.add(f"doc_{i}_{cat}", v, metadata={"category": cat})
+            offsets.append(o)
+
+        # Set additional metadata
+        for i, o in enumerate(offsets):
+            db.set_metadata(o, "idx", str(i))
+
+        # Verify metadata retrieval
+        check("Meta: get single key", db.get_metadata(offsets[0], "category") == "science")
+        check("Meta: get idx", db.get_metadata(offsets[3], "idx") == "3")
+        check("Meta: missing key = empty", db.get_metadata(offsets[0], "nonexistent") == "")
+
+        # get_all_metadata
+        all_meta = db.get_all_metadata(offsets[0])
+        check("Meta: get_all has category", "category" in all_meta)
+        check("Meta: get_all has idx", "idx" in all_meta)
+
+        # Filtered search: only science
+        q = make_vec(5000)  # should match doc_0_science
+        results_all = db.search(q, k=10)
+        results_science = db.search(q, k=10, where={"category": "science"})
+        results_art = db.search(q, k=10, where={"category": "art"})
+
+        check("Filter: all results >= science results",
+              len(results_all) >= len(results_science))
+
+        # All science results should have category=science
+        for offset, dist in results_science:
+            cat = db.get_metadata(offset, "category")
+            if cat != "science":
+                check("Filter: science only", False, f"got category={cat}")
+                break
+        else:
+            check("Filter: science only", True)
+
+        # Art results should all be art
+        for offset, dist in results_art:
+            cat = db.get_metadata(offset, "category")
+            if cat != "art":
+                check("Filter: art only", False, f"got category={cat}")
+                break
+        else:
+            check("Filter: art only", True)
+
+        # Count science = 4, art = 3
+        check("Filter: science count", len(results_science) == 4,
+              f"got {len(results_science)}")
+        check("Filter: art count", len(results_art) == 3,
+              f"got {len(results_art)}")
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 24: Distance Metrics
+# =============================================================================
+def test_distance_metrics():
+    print("\n[Test 24] Distance metrics")
+
+    # Test all 3 metrics
+    for metric_name in ["cosine", "l2", "ip"]:
+        path = tempfile.mktemp(suffix=".db")
+        try:
+            db = AgentKV(path, size_mb=5, dim=DIM, metric=metric_name)
+            check(f"Metric {metric_name}: created", db.metric == metric_name)
+
+            # Insert
+            v1 = make_vec(7001)
+            v2 = make_vec(7002)
+            o1 = db.add("m1", v1)
+            o2 = db.add("m2", v2)
+
+            # Self-search should return distance ~ 0
+            results = db.search(v1, k=1)
+            check(f"Metric {metric_name}: self-search",
+                  db.get_text(results[0][0]) == "m1")
+            if metric_name in ("cosine", "l2"):
+                check(f"Metric {metric_name}: self-dist ~0",
+                      results[0][1] < 0.01, f"got {results[0][1]:.6f}")
+            else:  # ip: distance = -dot, self should be most negative
+                check(f"Metric {metric_name}: self-dist most negative",
+                      results[0][1] < -0.5, f"got {results[0][1]:.6f}")
+
+            del db
+        finally:
+            if os.path.exists(path):
+                safe_remove(path)
+
+    # Invalid metric should raise
+    try:
+        db = AgentKV("_bad_metric.db", size_mb=1, dim=4, metric="hamming")
+        check("Metric: invalid raises", False, "no exception")
+        del db
+        safe_remove("_bad_metric.db")
+    except ValueError:
+        check("Metric: invalid raises", True)
+
+
+# =============================================================================
+#  v0.9 — Test 25: Count / Iteration
+# =============================================================================
+def test_count_iteration():
+    print("\n[Test 25] Count / Iteration")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=10, dim=DIM)
+
+        # Empty DB
+        check("Count: empty db", len(db) == 0)
+        check("Keys: empty db", len(db.keys()) == 0)
+
+        # Insert some nodes
+        N = 50
+        offsets = []
+        for i in range(N):
+            o = db.add(f"iter_{i}", make_vec(8000 + i))
+            offsets.append(o)
+
+        check("Count: after insert", len(db) == N, f"got {len(db)}")
+        check("Count: count() method", db.count() == N)
+
+        all_keys = db.keys()
+        check("Keys: length", len(all_keys) == N, f"got {len(all_keys)}")
+
+        # All inserted offsets should be in keys
+        keys_set = set(all_keys)
+        all_found = all(o in keys_set for o in offsets)
+        check("Keys: all offsets present", all_found)
+
+        # items() returns (offset, text)
+        items = db.items()
+        check("Items: length", len(items) == N)
+        texts = [t for _, t in items]
+        check("Items: all texts present",
+              all(f"iter_{i}" in texts for i in range(N)))
+
+        # Delete some and verify
+        for i in range(10):
+            db.delete(offsets[i])
+        check("Count: after delete 10", len(db) == N - 10,
+              f"got {len(db)}")
+        check("Keys: after delete 10", len(db.keys()) == N - 10)
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 26: SIMD Correctness
+# =============================================================================
+def test_simd_correctness():
+    print("\n[Test 26] SIMD correctness")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        # Test with various dimensions to exercise SIMD edge cases
+        for dim in [1, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 128, 256, 384, 768, 1536]:
+            db = AgentKV(path, size_mb=50, dim=dim, metric="cosine")
+
+            v = np.random.randn(dim).astype(np.float32)
+            v /= np.linalg.norm(v)
+            o = db.add("simd_test", v)
+
+            results = db.search(v, k=1)
+            dist = results[0][1]
+            # Self-distance for normalized cosine should be ~0
+            if dist > 0.001:
+                check(f"SIMD dim={dim} self-dist", False,
+                      f"expected ~0, got {dist:.6f}")
+                del db
+                safe_remove(path)
+                break
+            del db
+            safe_remove(path)
+        else:
+            check("SIMD: all dims correct", True)
+
+        # L2 cross-check: compute expected L2 in numpy, compare with DB
+        path2 = tempfile.mktemp(suffix=".db")
+        db = AgentKV(path2, size_mb=10, dim=DIM, metric="l2")
+        v_a = np.random.randn(DIM).astype(np.float32)
+        v_b = np.random.randn(DIM).astype(np.float32)
+        db.add("a", v_a)
+        db.add("b", v_b)
+        results = db.search(v_a, k=2)
+        # First result should be "a" with dist ~0 (self)
+        db_dist_self = results[0][1]
+        db_dist_other = results[1][1]
+        np_dist = float(np.sum((v_a - v_b) ** 2))
+        check("SIMD L2: self-dist ~0", db_dist_self < 0.001,
+              f"got {db_dist_self:.6f}")
+        check("SIMD L2: matches numpy",
+              abs(db_dist_other - np_dist) < 0.01,
+              f"db={db_dist_other:.6f} np={np_dist:.6f}")
+        del db
+        safe_remove(path2)
+
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 27: SIMD Edge Cases & Alignment
+# =============================================================================
+def test_simd_edge_cases():
+    print("\n[Test 27] SIMD edge cases & alignment")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        # 27a. Dimensions that are NOT multiples of SIMD lane widths
+        #      SSE=4, AVX2=8, unrolled=16. Test the tail-loop paths.
+        odd_dims = [1, 2, 3, 5, 6, 7, 9, 10, 13, 15, 17, 23, 25, 31, 33,
+                    63, 65, 127, 129, 255, 257]
+        all_ok = True
+        for dim in odd_dims:
+            db = AgentKV(path, size_mb=5, dim=dim, metric="cosine")
+            v = np.random.randn(dim).astype(np.float32)
+            v /= np.linalg.norm(v)
+            db.add("odd", v)
+            results = db.search(v, k=1)
+            if results[0][1] > 0.002:
+                check(f"SIMD odd dim={dim}", False,
+                      f"self-dist={results[0][1]:.6f}")
+                all_ok = False
+            del db
+            safe_remove(path)
+        check("SIMD: odd dimensions all correct", all_ok)
+
+        # 27b. Identical vectors — distance must be exactly 0 (or very close)
+        db = AgentKV(path, size_mb=5, dim=DIM, metric="l2")
+        v_same = np.ones(DIM, dtype=np.float32)
+        db.add("dup1", v_same)
+        db.add("dup2", v_same.copy())
+        results = db.search(v_same, k=2)
+        check("SIMD: identical L2 dist=0", results[0][1] < 1e-6,
+              f"got {results[0][1]:.9f}")
+        del db
+        safe_remove(path)
+
+        # 27c. Orthogonal vectors — cosine distance = 1.0
+        db = AgentKV(path, size_mb=5, dim=4, metric="cosine")
+        v_a = np.array([1, 0, 0, 0], dtype=np.float32)
+        v_b = np.array([0, 1, 0, 0], dtype=np.float32)
+        db.add("ortho_a", v_a)
+        db.add("ortho_b", v_b)
+        results = db.search(v_a, k=2)
+        # Self should be ~0, other should be ~1.0
+        check("SIMD: ortho self ~0", results[0][1] < 0.001)
+        check("SIMD: ortho other ~1.0",
+              abs(results[1][1] - 1.0) < 0.001,
+              f"got {results[1][1]:.6f}")
+        del db
+        safe_remove(path)
+
+        # 27d. Opposite vectors — cosine distance = 2.0
+        db = AgentKV(path, size_mb=5, dim=DIM, metric="cosine")
+        v_pos = make_vec(4001)
+        v_neg = -v_pos.copy()
+        db.add("pos", v_pos)
+        db.add("neg", v_neg)
+        results = db.search(v_pos, k=2)
+        check("SIMD: opposite dist ~2.0",
+              abs(results[1][1] - 2.0) < 0.01,
+              f"got {results[1][1]:.6f}")
+        del db
+        safe_remove(path)
+
+        # 27e. Zero vector handling (L2 metric — shouldn't crash)
+        db = AgentKV(path, size_mb=5, dim=DIM, metric="l2")
+        v_zero = np.zeros(DIM, dtype=np.float32)
+        v_one = np.ones(DIM, dtype=np.float32)
+        db.add("zero", v_zero)
+        db.add("one", v_one)
+        results = db.search(v_zero, k=2)
+        expected_l2 = float(DIM)  # sum(1^2) * DIM times
+        check("SIMD: zero vs ones L2",
+              abs(results[1][1] - expected_l2) < 0.1,
+              f"expected {expected_l2}, got {results[1][1]:.2f}")
+        del db
+        safe_remove(path)
+
+        # 27f. Very large values — no overflow in float32 accumulation
+        db = AgentKV(path, size_mb=5, dim=DIM, metric="l2")
+        v_big = np.full(DIM, 1000.0, dtype=np.float32)
+        v_big2 = np.full(DIM, 1001.0, dtype=np.float32)
+        db.add("big", v_big)
+        db.add("big2", v_big2)
+        results = db.search(v_big, k=2)
+        expected = float(DIM)  # sum((1001-1000)^2) = DIM
+        check("SIMD: large values L2",
+              abs(results[1][1] - expected) < 1.0,
+              f"expected {expected}, got {results[1][1]:.2f}")
+        del db
+        safe_remove(path)
+
+        # 27g. Inner product metric cross-check
+        db = AgentKV(path, size_mb=5, dim=DIM, metric="ip")
+        v_ip = make_vec(4444)
+        db.add("ip_a", v_ip)
+        db.add("ip_b", -v_ip)
+        results = db.search(v_ip, k=2)
+        # ip distance = -dot. Self: -dot(v,v) = -1.0 (normalized)
+        check("SIMD: ip self dist ~-1.0",
+              abs(results[0][1] - (-1.0)) < 0.01,
+              f"got {results[0][1]:.6f}")
+        # Opposite: -dot(v,-v) = +1.0
+        check("SIMD: ip opposite dist ~+1.0",
+              abs(results[1][1] - 1.0) < 0.01,
+              f"got {results[1][1]:.6f}")
+        del db
+        safe_remove(path)
+
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 28: Metadata Stress & Edge Cases
+# =============================================================================
+def test_metadata_stress():
+    print("\n[Test 28] Metadata stress & edge cases")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=20, dim=DIM)
+
+        v = make_vec(6001)
+        o = db.add("meta_node", v)
+
+        # 28a. Many keys on one node
+        N_KEYS = 100
+        for i in range(N_KEYS):
+            db.set_metadata(o, f"key_{i}", f"val_{i}")
+        all_meta = db.get_all_metadata(o)
+        check("MetaStress: many keys count", len(all_meta) == N_KEYS,
+              f"got {len(all_meta)}")
+        check("MetaStress: many keys read",
+              db.get_metadata(o, "key_50") == "val_50")
+
+        # 28b. Overwrite a key (prepend semantics — first match wins)
+        db.set_metadata(o, "key_0", "UPDATED")
+        check("MetaStress: overwrite", db.get_metadata(o, "key_0") == "UPDATED")
+
+        # 28c. Empty key and value
+        db.set_metadata(o, "", "empty_key_val")
+        check("MetaStress: empty key", db.get_metadata(o, "") == "empty_key_val")
+
+        db.set_metadata(o, "empty_val", "")
+        check("MetaStress: empty value", db.get_metadata(o, "empty_val") == "")
+
+        # 28d. Long key/value (1KB each)
+        long_key = "K" * 1024
+        long_val = "V" * 1024
+        db.set_metadata(o, long_key, long_val)
+        check("MetaStress: long key/val", db.get_metadata(o, long_key) == long_val)
+
+        # 28e. Unicode in metadata
+        db.set_metadata(o, "lang", "日本語テスト")
+        check("MetaStress: unicode meta",
+              db.get_metadata(o, "lang") == "日本語テスト")
+
+        # 28f. Special characters
+        db.set_metadata(o, "special", "a=b&c=d\nnewline\ttab")
+        check("MetaStress: special chars",
+              db.get_metadata(o, "special") == "a=b&c=d\nnewline\ttab")
+
+        # 28g. Metadata filtering with many nodes
+        N_FILTER = 500
+        colors = ["red", "green", "blue", "yellow", "purple"]
+        vecs = np.random.randn(N_FILTER, DIM).astype(np.float32)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        texts = [f"filt_{i}" for i in range(N_FILTER)]
+        metas = [{"color": colors[i % len(colors)]} for i in range(N_FILTER)]
+        filter_offsets = db.add_batch(texts, vecs, metas)
+
+        q = vecs[0]  # Should match filt_0 (red)
+        red_results = db.search(q, k=N_FILTER, where={"color": "red"})
+        expected_red = N_FILTER // len(colors)  # 100
+        check("MetaStress: filter count",
+              len(red_results) == expected_red,
+              f"expected {expected_red}, got {len(red_results)}")
+
+        # All red results should actually be red
+        all_red = all(db.get_metadata(off, "color") == "red"
+                      for off, _ in red_results)
+        check("MetaStress: filter correctness", all_red)
+
+        # 28h. Multi-key filter
+        for off in filter_offsets[:50]:
+            db.set_metadata(off, "priority", "high")
+        for off in filter_offsets[50:]:
+            db.set_metadata(off, "priority", "low")
+
+        # Search red + high priority
+        red_high = db.search(q, k=N_FILTER,
+                             where={"color": "red", "priority": "high"})
+        # Among first 50 (high), red ones are those at indices 0,5,10,...,45 = 10
+        check("MetaStress: multi-key filter",
+              len(red_high) == 10,
+              f"got {len(red_high)}")
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 29: Delete/Update Edge Cases
+# =============================================================================
+def test_delete_update_edge_cases():
+    print("\n[Test 29] Delete/Update edge cases")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=10, dim=DIM)
+
+        # 29a. Delete all nodes — DB should be empty but functional
+        offsets = []
+        for i in range(20):
+            offsets.append(db.add(f"del_all_{i}", make_vec(3000 + i)))
+        for o in offsets:
+            db.delete(o)
+        check("DelEdge: all deleted count=0", len(db) == 0)
+        check("DelEdge: keys empty", len(db.keys()) == 0)
+
+        # Can still insert after deleting everything
+        o_new = db.add("after_nuke", make_vec(3999))
+        check("DelEdge: insert after full delete", len(db) == 1)
+        results = db.search(make_vec(3999), k=1)
+        check("DelEdge: search after full delete",
+              len(results) > 0 and db.get_text(results[0][0]) == "after_nuke",
+              f"got {len(results)} results")
+
+        # 29b. Search returns fewer than k when nodes are deleted
+        db2_path = tempfile.mktemp(suffix=".db")
+        db2 = AgentKV(db2_path, size_mb=5, dim=DIM)
+        o_keep = []
+        for i in range(10):
+            o = db2.add(f"sparse_{i}", make_vec(3100 + i))
+            if i >= 7:
+                db2.delete(o)
+            else:
+                o_keep.append(o)
+        results = db2.search(make_vec(3100), k=10)
+        check("DelEdge: search respects k vs live",
+              len(results) <= 7,
+              f"got {len(results)} results (expected <=7)")
+        del db2
+        safe_remove(db2_path)
+
+        # 29c. Update preserves metadata
+        o_meta = db.add("has_meta", make_vec(3200),
+                        metadata={"color": "blue", "priority": "high"})
+        o_updated = db.update(o_meta, "has_meta_v2", make_vec(3201),
+                              metadata={"color": "green", "priority": "high"})
+        check("DelEdge: update meta color",
+              db.get_metadata(o_updated, "color") == "green")
+        check("DelEdge: update meta priority",
+              db.get_metadata(o_updated, "priority") == "high")
+        check("DelEdge: old offset is deleted",
+              db.engine.is_deleted(o_meta))
+
+        # 29d. Rapid insert-delete cycles
+        for cycle in range(50):
+            o = db.add(f"cycle_{cycle}", make_vec(3300 + cycle))
+            db.delete(o)
+        live_count = len(db)
+        check("DelEdge: rapid cycles stable",
+              live_count >= 1, f"count={live_count}")
+
+        # 29e. Delete should not affect other nodes' search results
+        db3_path = tempfile.mktemp(suffix=".db")
+        db3 = AgentKV(db3_path, size_mb=5, dim=DIM)
+        v_target = make_vec(3400)
+        o_target = db3.add("target", v_target)
+        neighbors = []
+        for i in range(20):
+            neighbors.append(db3.add(f"neighbor_{i}", make_vec(3401 + i)))
+        # Delete half the neighbors
+        for o in neighbors[:10]:
+            db3.delete(o)
+        results = db3.search(v_target, k=1)
+        check("DelEdge: target still found",
+              db3.get_text(results[0][0]) == "target")
+        del db3
+        safe_remove(db3_path)
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 30: Batch Operations Edge Cases
+# =============================================================================
+def test_batch_edge_cases():
+    print("\n[Test 30] Batch operations edge cases")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=20, dim=DIM)
+
+        # 30a. Batch of size 1
+        vecs1 = np.random.randn(1, DIM).astype(np.float32)
+        vecs1 /= np.linalg.norm(vecs1, axis=1, keepdims=True)
+        offsets1 = db.add_batch(["single"], vecs1)
+        check("BatchEdge: batch of 1", len(offsets1) == 1)
+        check("BatchEdge: text of 1", db.get_text(offsets1[0]) == "single")
+
+        # 30b. Batch with metadata — all nodes get correct tags
+        N = 100
+        vecs = np.random.randn(N, DIM).astype(np.float32)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        texts = [f"batch_m_{i}" for i in range(N)]
+        metas = [{"idx": str(i), "group": "A" if i < 50 else "B"} for i in range(N)]
+        offsets = db.add_batch(texts, vecs, metas)
+
+        check("BatchEdge: meta[0].idx", db.get_metadata(offsets[0], "idx") == "0")
+        check("BatchEdge: meta[99].idx", db.get_metadata(offsets[99], "idx") == "99")
+        check("BatchEdge: meta[0].group", db.get_metadata(offsets[0], "group") == "A")
+        check("BatchEdge: meta[50].group", db.get_metadata(offsets[50], "group") == "B")
+
+        # 30c. Large batch
+        N_LARGE = 1000
+        large_vecs = np.random.randn(N_LARGE, DIM).astype(np.float32)
+        large_vecs /= np.linalg.norm(large_vecs, axis=1, keepdims=True)
+        large_texts = [f"large_{i}" for i in range(N_LARGE)]
+        t0 = time.time()
+        large_offsets = db.add_batch(large_texts, large_vecs)
+        batch_time = time.time() - t0
+        check("BatchEdge: large batch count",
+              len(large_offsets) == N_LARGE)
+        print(f"    1000 batch insert: {batch_time:.2f}s")
+
+        # 30d. Search after batch should be accurate
+        q = large_vecs[500]
+        results = db.search(q, k=1)
+        check("BatchEdge: search finds exact after batch",
+              db.get_text(results[0][0]) == "large_500",
+              f"got {db.get_text(results[0][0])}")
+
+        # 30e. Total count is consistent
+        expected_total = 1 + N + N_LARGE
+        check("BatchEdge: total count",
+              len(db) == expected_total,
+              f"expected {expected_total}, got {len(db)}")
+
+        # 30f. Batch with empty texts
+        empty_vecs = np.random.randn(5, DIM).astype(np.float32)
+        empty_vecs /= np.linalg.norm(empty_vecs, axis=1, keepdims=True)
+        empty_texts = ["", "has_text", "", "", "also_text"]
+        empty_offsets = db.add_batch(empty_texts, empty_vecs)
+        check("BatchEdge: empty text stored",
+              db.get_text(empty_offsets[0]) == "")
+        check("BatchEdge: non-empty text stored",
+              db.get_text(empty_offsets[1]) == "has_text")
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 31: Concurrent Operations on New Features
+# =============================================================================
+def test_concurrent_new_features():
+    print("\n[Test 31] Concurrent operations on new features")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=20, dim=DIM)
+
+        # Pre-populate
+        N = 200
+        vecs = np.random.randn(N, DIM).astype(np.float32)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        texts = [f"conc_{i}" for i in range(N)]
+        offsets = db.add_batch(texts, vecs)
+
+        conc_errors = []
+
+        # 31a. Concurrent reads (search + metadata) while writer deletes
+        def reader_search(n_iters):
+            try:
+                for _ in range(n_iters):
+                    q = np.random.randn(DIM).astype(np.float32)
+                    q /= np.linalg.norm(q)
+                    results = db.search(q, k=5)
+                    # Results should only contain non-deleted nodes
+                    for off, dist in results:
+                        if db.engine.is_deleted(off):
+                            conc_errors.append("Got deleted node in search")
+            except Exception as e:
+                conc_errors.append(f"reader_search: {e}")
+
+        def reader_metadata(n_iters):
+            try:
+                for _ in range(n_iters):
+                    for off in offsets[:20]:
+                        try:
+                            db.get_text(off)
+                        except Exception:
+                            pass  # Node might be deleted
+            except Exception as e:
+                conc_errors.append(f"reader_metadata: {e}")
+
+        def writer_delete(indices):
+            try:
+                for i in indices:
+                    db.delete(offsets[i])
+                    time.sleep(0.001)
+            except Exception as e:
+                conc_errors.append(f"writer_delete: {e}")
+
+        def writer_insert(n):
+            try:
+                for i in range(n):
+                    v = np.random.randn(DIM).astype(np.float32)
+                    v /= np.linalg.norm(v)
+                    db.add(f"conc_new_{i}", v)
+            except Exception as e:
+                conc_errors.append(f"writer_insert: {e}")
+
+        threads = [
+            threading.Thread(target=reader_search, args=(50,)),
+            threading.Thread(target=reader_search, args=(50,)),
+            threading.Thread(target=reader_metadata, args=(20,)),
+            threading.Thread(target=writer_delete, args=(list(range(50, 100)),)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        check("Conc: no errors in mixed ops", len(conc_errors) == 0,
+              "; ".join(conc_errors[:3]))
+
+        # 31b. Concurrent filtered search + insert
+        for off in offsets[:50]:
+            db.set_metadata(off, "tag", "searchable")
+
+        conc_errors2 = []
+
+        def filtered_reader(n_iters):
+            try:
+                for _ in range(n_iters):
+                    q = np.random.randn(DIM).astype(np.float32)
+                    q /= np.linalg.norm(q)
+                    db.search(q, k=5, where={"tag": "searchable"})
+            except Exception as e:
+                conc_errors2.append(f"filtered_reader: {e}")
+
+        threads2 = [
+            threading.Thread(target=filtered_reader, args=(30,)),
+            threading.Thread(target=filtered_reader, args=(30,)),
+            threading.Thread(target=writer_insert, args=(20,)),
+        ]
+        for t in threads2:
+            t.start()
+        for t in threads2:
+            t.join(timeout=30)
+
+        check("Conc: filtered search + insert", len(conc_errors2) == 0,
+              "; ".join(conc_errors2[:3]))
+
+        # 31c. Concurrent count/keys consistency
+        count_before = len(db)
+        keys_before = len(db.keys())
+        check("Conc: count == keys length",
+              count_before == keys_before,
+              f"count={count_before}, keys={keys_before}")
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 32: Cross-Platform Consistency
+# =============================================================================
+def test_cross_platform():
+    print("\n[Test 32] Cross-platform consistency")
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        db = AgentKV(path, size_mb=10, dim=DIM)
+
+        # 32a. Deterministic vectors: same seed must produce same results
+        v1 = make_vec(42)
+        v2 = make_vec(42)
+        check("XPlat: deterministic vectors", np.allclose(v1, v2))
+
+        # 32b. Insert deterministic data, verify exact byte-level results
+        np.random.seed(12345)
+        N = 100
+        for i in range(N):
+            v = make_vec(12345 + i)
+            db.add(f"xplat_{i}", v)
+
+        # Search must return exact same ordering with same query
+        q = make_vec(12345)
+        results = db.search(q, k=5)
+        check("XPlat: search returns results", len(results) == 5)
+        check("XPlat: self is first",
+              db.get_text(results[0][0]) == "xplat_0")
+
+        # 32c. Text encoding: full Unicode range survives roundtrip
+        test_strings = [
+            "ASCII only",
+            "Accents: cafe\u0301 re\u0301sume\u0301",
+            "CJK: \u4f60\u597d\u4e16\u754c",
+            "Emoji: \U0001f680\U0001f525\u2764\ufe0f",
+            "Arabic: \u0645\u0631\u062d\u0628\u0627",
+            "Math: \u03b1 \u03b2 \u03b3 \u2192 \u221e",
+            "Null-adjacent: abc\x01\x02\x03def",
+            "Mixed: Hello \u4e16\u754c \U0001f600 caf\u00e9",
+        ]
+        for i, s in enumerate(test_strings):
+            v = make_vec(20000 + i)
+            o = db.add(s, v)
+            got = db.get_text(o)
+            if got != s:
+                check(f"XPlat: unicode[{i}]", False,
+                      f"expected {repr(s)}, got {repr(got)}")
+                break
+        else:
+            check("XPlat: all unicode roundtrips", True)
+
+        # 32d. File size is OS-independent (same inputs = same write_head)
+        count = len(db)
+        check("XPlat: count matches", count == N + len(test_strings),
+              f"got {count}")
+
+        # 32e. Metadata with unicode keys/values
+        o_uni = db.add("uni_meta", make_vec(20100))
+        db.set_metadata(o_uni, "\u30ad\u30fc", "\u5024")
+        check("XPlat: unicode metadata",
+              db.get_metadata(o_uni, "\u30ad\u30fc") == "\u5024")
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
+
+
+# =============================================================================
+#  v0.9 — Test 33: Performance Regression Baseline
+# =============================================================================
+def test_performance_baseline():
+    print("\n[Test 33] Performance regression baseline")
+    path = tempfile.mktemp(suffix=".db")
+    is_win = sys.platform == "win32"
+    try:
+        db = AgentKV(path, size_mb=50, dim=DIM)
+
+        # 33a. Single-insert throughput
+        N_INSERT = 500
+        vecs = np.random.randn(N_INSERT, DIM).astype(np.float32)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        t0 = time.time()
+        offsets = []
+        for i in range(N_INSERT):
+            offsets.append(db.add(f"perf_{i}", vecs[i]))
+        seq_time = time.time() - t0
+        seq_per = (seq_time / N_INSERT) * 1e6
+        insert_limit = 10000 if is_win else 5000
+        print(f"    Sequential insert: {seq_per:.0f} us/vec ({N_INSERT} vecs)")
+        check("Perf: seq insert < limit",
+              seq_per < insert_limit,
+              f"{seq_per:.0f} us/vec (limit {insert_limit})")
+
+        # 33b. Batch-insert throughput
+        N_BATCH = 1000
+        batch_vecs = np.random.randn(N_BATCH, DIM).astype(np.float32)
+        batch_vecs /= np.linalg.norm(batch_vecs, axis=1, keepdims=True)
+        batch_texts = [f"bperf_{i}" for i in range(N_BATCH)]
+        t0 = time.time()
+        db.add_batch(batch_texts, batch_vecs)
+        batch_time = time.time() - t0
+        batch_per = (batch_time / N_BATCH) * 1e6
+        batch_limit = 8000 if is_win else 4000
+        print(f"    Batch insert: {batch_per:.0f} us/vec ({N_BATCH} vecs)")
+        check("Perf: batch insert < limit",
+              batch_per < batch_limit,
+              f"{batch_per:.0f} us/vec (limit {batch_limit})")
+
+        # 33c. Search latency
+        N_QUERIES = 200
+        t0 = time.time()
+        for i in range(N_QUERIES):
+            db.search(vecs[i % N_INSERT], k=10, ef_search=50)
+        search_time = time.time() - t0
+        search_per = (search_time / N_QUERIES) * 1e6
+        search_limit = 5000 if is_win else 3000
+        print(f"    Search: {search_per:.0f} us/query ({N_QUERIES} queries, "
+              f"{N_INSERT + N_BATCH} total nodes)")
+        check("Perf: search < limit",
+              search_per < search_limit,
+              f"{search_per:.0f} us/query (limit {search_limit})")
+
+        # 33d. Filtered search latency (should not be much slower)
+        for off in offsets[:250]:
+            db.set_metadata(off, "perf_tag", "yes")
+        t0 = time.time()
+        for i in range(N_QUERIES):
+            db.search(vecs[i % N_INSERT], k=10,
+                      where={"perf_tag": "yes"})
+        filter_time = time.time() - t0
+        filter_per = (filter_time / N_QUERIES) * 1e6
+        filter_limit = 10000 if is_win else 6000
+        print(f"    Filtered search: {filter_per:.0f} us/query")
+        check("Perf: filtered search < limit",
+              filter_per < filter_limit,
+              f"{filter_per:.0f} us/query (limit {filter_limit})")
+
+        # 33e. Delete throughput
+        t0 = time.time()
+        for off in offsets:
+            db.delete(off)
+        del_time = time.time() - t0
+        del_per = (del_time / len(offsets)) * 1e6
+        print(f"    Delete: {del_per:.0f} us/node ({len(offsets)} nodes)")
+        check("Perf: delete < 100us", del_per < 100,
+              f"{del_per:.0f} us/node")
+
+        # 33f. Count / iteration performance
+        t0 = time.time()
+        for _ in range(100):
+            _ = len(db)
+        count_time = time.time() - t0
+        print(f"    100x len(): {count_time*1000:.1f} ms")
+        check("Perf: len() fast", count_time < 0.1,
+              f"{count_time*1000:.1f} ms")
+
+        t0 = time.time()
+        _ = db.keys()
+        keys_time = time.time() - t0
+        print(f"    keys() ({len(db)} nodes): {keys_time*1000:.1f} ms")
+        keys_limit = 100 if is_win else 50
+        check("Perf: keys() < limit",
+              keys_time * 1000 < keys_limit,
+              f"{keys_time*1000:.1f} ms (limit {keys_limit}ms)")
+
+        del db
+    finally:
+        if os.path.exists(path):
+            safe_remove(path)
 
 
 # ─────────────────────────────────────────────────────
@@ -1075,8 +2078,8 @@ def test_api_completeness():
 # ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("  AgentKV v0.7 — Pre-Release Test Suite")
-    print("  (10 core + 10 extended = 20 test groups)")
+    print("  AgentKV v0.9 — Full Test Suite")
+    print("  (10 core + 10 extended + 6 v0.9 + 7 edge cases = 33 test groups)")
     print("=" * 60)
 
     t_start = time.time()
@@ -1108,6 +2111,23 @@ if __name__ == "__main__":
     # ── Nice to have (19-20) ──
     test_recall_quality()
     test_api_completeness()
+
+    # ── v0.9 Features (21-26) ──
+    test_batch_insert()
+    test_delete_update()
+    test_metadata_filtering()
+    test_distance_metrics()
+    test_count_iteration()
+    test_simd_correctness()
+
+    # ── v0.9 Edge Cases (27-33) ──
+    test_simd_edge_cases()
+    test_metadata_stress()
+    test_delete_update_edge_cases()
+    test_batch_edge_cases()
+    test_concurrent_new_features()
+    test_cross_platform()
+    test_performance_baseline()
 
     elapsed = time.time() - t_start
     print(f"\n{'=' * 60}")

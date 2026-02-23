@@ -1,5 +1,7 @@
 #pragma once
 #include "storage.h"
+#include "mmap_platform.h"
+#include "simd.h"
 #include <string>
 #include <vector>
 #include <random>
@@ -7,7 +9,6 @@
 #include <shared_mutex>
 #include <cstdint>
 #include <cstddef>
-#include <sys/mman.h>
 
 // Simple CRC-32 (ISO 3309 polynomial)
 inline uint32_t crc32_compute(const void* data, size_t length) {
@@ -20,6 +21,12 @@ inline uint32_t crc32_compute(const void* data, size_t length) {
     }
     return ~crc;
 }
+
+// Metadata filter for search: exact match on key=value
+struct MetadataFilter {
+    std::string key;
+    std::string value;
+};
 
 // RAII Read Lock Guard
 class ReadGuard {
@@ -43,8 +50,7 @@ public:
 
 class KVEngine {
 private:
-    int fd;
-    void* map_base;
+    platform::MMapHandle mmap_;
     StorageHeader* header;
     std::string filepath;
     std::mt19937 rng;
@@ -68,8 +74,8 @@ private:
     }
 
     // HNSW Internal
-    // Returns raw dot product (higher = more similar)
-    float dist_dot(const float* a, const float* b, uint32_t dim);
+    // Compute distance using the DB's configured metric + SIMD
+    float compute_dist(const float* a, const float* b, uint32_t dim);
     // Search within a single HNSW layer. Returns up to ef nearest neighbors.
     // result: vector of (distance, node_offset) — sorted ascending by distance.
     std::vector<std::pair<float, uint64_t>> search_layer(
@@ -80,9 +86,16 @@ private:
     // Select up to M best neighbors from candidates (simple heuristic: closest M)
     std::vector<std::pair<float, uint64_t>> select_neighbors(
         const std::vector<std::pair<float, uint64_t>>& candidates, int M);
+    // Check if a node passes all metadata filters
+    bool passes_filters(uint64_t node_offset,
+                        const std::vector<MetadataFilter>& filters);
+
+    // Node linked-list helper (prepend to list, update header)
+    void link_node(uint64_t node_offset);
 
 public:
-    KVEngine(const std::string& path, size_t size_bytes);
+    KVEngine(const std::string& path, size_t size_bytes,
+             DistanceMetric metric = METRIC_COSINE);
     ~KVEngine();
 
     // Core API
@@ -93,7 +106,7 @@ public:
 
     // Crash Recovery API
     bool is_valid() const { return validate_header_const(); }
-    void sync() { msync(map_base, header->capacity, MS_SYNC); }
+    void sync() { platform::mmap_sync(mmap_, header->capacity); }
 
     // String Arena API
     uint64_t store_text(const std::string& text);
@@ -107,10 +120,43 @@ public:
     // Thread-safe: acquires read lock.
     std::vector<std::pair<uint64_t, float>> search_knn(
         const float* query, uint32_t dim, int k, int ef_search = 50);
+    // Filtered K-NN search: same as search_knn but skips nodes failing metadata filters.
+    std::vector<std::pair<uint64_t, float>> search_knn_filtered(
+        const float* query, uint32_t dim, int k, int ef_search,
+        const std::vector<MetadataFilter>& filters);
     // Dynamic HNSW insertion: creates node, assigns level, wires bidirectional links.
     // Thread-safe: acquires write lock. Returns the node offset.
     uint64_t insert(uint64_t id, const std::vector<float>& embedding,
                     const std::string& text = "");
+    // Batch insert: insert N vectors in a single lock acquisition.
+    // Returns vector of node offsets. Thread-safe.
+    std::vector<uint64_t> insert_batch(
+        const uint64_t* ids, const float* data, uint32_t n, uint32_t dim,
+        const std::vector<std::string>& texts);
+
+    // Delete / Update API
+    // Tombstone a node — it will be skipped in search and iteration.
+    void delete_node(uint64_t node_offset);
+    bool is_deleted(uint64_t node_offset);
+    // Update = tombstone old + insert new. Returns new node offset.
+    uint64_t update_node(uint64_t old_offset, uint64_t new_id,
+                         const std::vector<float>& embedding,
+                         const std::string& text = "");
+
+    // Metadata API
+    void set_metadata(uint64_t node_offset, const std::string& key,
+                      const std::string& value);
+    std::string get_metadata(uint64_t node_offset, const std::string& key);
+    std::vector<std::pair<std::string, std::string>>
+        get_all_metadata(uint64_t node_offset);
+
+    // Count / Iteration API
+    uint64_t count() const;       // live nodes (total - deleted)
+    uint64_t total_count() const; // total nodes ever created
+    // Walk the node linked list, skipping deleted. Returns offsets.
+    std::vector<uint64_t> get_all_node_offsets();
+    // Get the configured distance metric
+    uint32_t get_metric() const { return header->metric; }
 
     // --- Friend Class for SLB ---
     friend class ContextManager;
@@ -128,5 +174,5 @@ public:
 template <typename T>
 T* KVEngine::get_ptr(uint64_t offset) {
     if (offset == NULL_OFFSET) return nullptr;
-    return reinterpret_cast<T*>((char*)map_base + offset);
+    return reinterpret_cast<T*>((char*)mmap_.ptr + offset);
 }

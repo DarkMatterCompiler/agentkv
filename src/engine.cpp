@@ -1,8 +1,5 @@
 #include "engine.h"
 #include <iostream>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
 #include <cstring>
 #include <stdexcept>
 #include <cmath>
@@ -11,16 +8,15 @@
 #include <unordered_set>
 
 // =============================================================================
-// Constructor — with crash recovery
+// Constructor — with crash recovery + metric selection
 // =============================================================================
-KVEngine::KVEngine(const std::string& path, size_t size_bytes) : filepath(path) {
-    fd = open(path.c_str(), O_RDWR | O_CREAT, 0666);
-    if (fd == -1) throw std::runtime_error("Failed to open file: " + path);
-    if (ftruncate(fd, size_bytes) == -1) throw std::runtime_error("Resize failed");
-    map_base = mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map_base == MAP_FAILED) throw std::runtime_error("mmap failed");
+KVEngine::KVEngine(const std::string& path, size_t size_bytes,
+                   DistanceMetric metric)
+    : filepath(path)
+{
+    mmap_ = platform::mmap_open(path.c_str(), size_bytes);
 
-    header = static_cast<StorageHeader*>(map_base);
+    header = static_cast<StorageHeader*>(mmap_.ptr);
     
     // Initialize RNG
     std::random_device rd;
@@ -46,9 +42,15 @@ KVEngine::KVEngine(const std::string& path, size_t size_bytes) : filepath(path) 
         header->safe_hnsw_entry_point = NULL_OFFSET;
         header->safe_hnsw_max_level = -1;
         header->_recovery_pad = 0;
+
+        // v0.9 fields
+        header->metric = static_cast<uint32_t>(metric);
+        header->node_count = 0;
+        header->deleted_count = 0;
+        header->first_node_offset = NULL_OFFSET;
         
         update_header_checksum();
-        msync(map_base, PAGE_SIZE, MS_SYNC);
+        platform::mmap_sync(mmap_, PAGE_SIZE);
     } else {
         // --- Existing database: check for crash recovery ---
         recover_if_needed();
@@ -57,7 +59,7 @@ KVEngine::KVEngine(const std::string& path, size_t size_bytes) : filepath(path) 
     // Mark as "open / not cleanly shut down"
     header->flags &= ~FLAG_CLEAN_SHUTDOWN;
     update_header_checksum();
-    msync(map_base, PAGE_SIZE, MS_SYNC);
+    platform::mmap_sync(mmap_, PAGE_SIZE);
 }
 
 // =============================================================================
@@ -69,9 +71,8 @@ KVEngine::~KVEngine() {
     header->flags &= ~FLAG_WRITE_IN_PROGRESS;
     checkpoint_header();
     update_header_checksum();
-    msync(map_base, header->capacity, MS_SYNC);
-    munmap(map_base, header->capacity);
-    close(fd);
+    platform::mmap_sync_all(mmap_);
+    platform::mmap_close(mmap_);
 }
 
 // =============================================================================
@@ -126,7 +127,7 @@ void KVEngine::recover_if_needed() {
 
     header->flags &= ~FLAG_WRITE_IN_PROGRESS;
     update_header_checksum();
-    msync(map_base, PAGE_SIZE, MS_SYNC);
+    platform::mmap_sync(mmap_, PAGE_SIZE);
 }
 
 // =============================================================================
@@ -196,14 +197,29 @@ uint64_t KVEngine::create_node(uint64_t id, const std::vector<float>& embedding,
     Node* node = get_ptr<Node>(node_offset);
     
     node->id = id;
-    node->timestamp = 0; // TODO: Realtime clock
+    node->next_node_offset = NULL_OFFSET;
     node->vector_head = vec_offset;
     node->text_offset = txt_offset;
+    node->metadata_offset = NULL_OFFSET;
     node->edge_list_head = NULL_OFFSET;
     node->hnsw_head = NULL_OFFSET;
-    node->version_lock = 0;
+    node->node_flags.store(0);
+    node->_node_pad = 0;
+
+    // 4. Link into iteration list + increment count
+    link_node(node_offset);
 
     return node_offset;
+}
+
+// =============================================================================
+// Node Linked List: Prepend node to the iteration list
+// =============================================================================
+void KVEngine::link_node(uint64_t node_offset) {
+    Node* node = get_ptr<Node>(node_offset);
+    node->next_node_offset = header->first_node_offset.load();
+    header->first_node_offset.store(node_offset);
+    header->node_count.fetch_add(1);
 }
 
 // =============================================================================
@@ -260,15 +276,18 @@ void KVEngine::print_node(uint64_t offset) {
 }
 
 // =============================================================================
-// HNSW: Dot Product (auto-vectorizable with -march=native -O3)
+// Distance: SIMD-accelerated, metric-aware
 // =============================================================================
-float KVEngine::dist_dot(const float* a, const float* b, uint32_t dim) {
-    float sum = 0.0f;
-    // Compiler will auto-vectorize this loop with SSE/AVX
-    for (uint32_t i = 0; i < dim; ++i) {
-        sum += a[i] * b[i];
+float KVEngine::compute_dist(const float* a, const float* b, uint32_t dim) {
+    switch (header->metric) {
+        case METRIC_L2:
+            return simd::l2sq(a, b, dim);
+        case METRIC_INNER_PRODUCT:
+            return -simd::dot(a, b, dim);  // negate: higher dot = smaller dist
+        case METRIC_COSINE:
+        default:
+            return 1.0f - simd::dot(a, b, dim);
     }
-    return sum;
 }
 
 // =============================================================================
@@ -400,6 +419,7 @@ void KVEngine::prune_neighbors(uint64_t node_offset, int layer) {
 // =============================================================================
 // HNSW: Search Layer (Greedy BFS with beam width ef)
 // Returns vector of (distance, node_offset) sorted ascending by distance
+// Skips deleted nodes.
 // =============================================================================
 std::vector<std::pair<float, uint64_t>> KVEngine::search_layer(
     const float* query, uint32_t dim,
@@ -413,7 +433,8 @@ std::vector<std::pair<float, uint64_t>> KVEngine::search_layer(
     Node* entry_node = get_ptr<Node>(entry_offset);
     if (!entry_node || entry_node->vector_head == NULL_OFFSET) return {};
     VectorBlock* entry_vb = get_ptr<VectorBlock>(entry_node->vector_head);
-    float entry_dist = 1.0f - dist_dot(query, entry_vb->data, dim);
+    float entry_dist = compute_dist(query, entry_vb->data, dim);
+    bool entry_deleted = (entry_node->node_flags.load() & NODE_DELETED) != 0;
 
     // candidates: min-heap (smallest dist on top)
     std::priority_queue<Pair, std::vector<Pair>, std::greater<Pair>> candidates;
@@ -423,7 +444,11 @@ std::vector<std::pair<float, uint64_t>> KVEngine::search_layer(
     std::unordered_set<uint64_t> visited;
 
     candidates.push({entry_dist, entry_offset});
-    result.push({entry_dist, entry_offset});
+    // Only add non-deleted entry to result set; deleted entries still serve as
+    // traversal starting points so the graph remains connected.
+    if (!entry_deleted) {
+        result.push({entry_dist, entry_offset});
+    }
     visited.insert(entry_offset);
 
     while (!candidates.empty()) {
@@ -431,8 +456,11 @@ std::vector<std::pair<float, uint64_t>> KVEngine::search_layer(
         candidates.pop();
 
         // If the closest candidate is farther than the farthest result, stop
-        float f_dist = result.top().first;
-        if (c_dist > f_dist) break;
+        // (but only if we have enough results already)
+        if (!result.empty()) {
+            float f_dist = result.top().first;
+            if (c_dist > f_dist && (int)result.size() >= ef) break;
+        }
 
         // Explore neighbors at this layer
         Node* c_node = get_ptr<Node>(c_offset);
@@ -457,12 +485,20 @@ std::vector<std::pair<float, uint64_t>> KVEngine::search_layer(
 
             VectorBlock* n_vb = get_ptr<VectorBlock>(n_node->vector_head);
             if (n_vb->dim != dim) continue; // Dimension mismatch guard
-            float n_dist = 1.0f - dist_dot(query, n_vb->data, dim);
+            float n_dist = compute_dist(query, n_vb->data, dim);
 
-            f_dist = result.top().first;
+            // Deleted nodes are still traversed (added to candidates)
+            // but NOT added to the result set
+            bool n_deleted = (n_node->node_flags.load() & NODE_DELETED) != 0;
 
-            if (n_dist < f_dist || (int)result.size() < ef) {
+            bool dominated = result.empty() ||
+                             n_dist < result.top().first ||
+                             (int)result.size() < ef;
+
+            if (dominated || n_deleted) {
                 candidates.push({n_dist, n_offset});
+            }
+            if (dominated && !n_deleted) {
                 result.push({n_dist, n_offset});
 
                 if ((int)result.size() > ef) {
@@ -549,7 +585,7 @@ uint64_t KVEngine::insert(uint64_t id, const std::vector<float>& embedding,
     // --- Crash Recovery: checkpoint before mutation ---
     checkpoint_header();
     header->flags |= FLAG_WRITE_IN_PROGRESS;
-    msync(map_base, PAGE_SIZE, MS_SYNC);
+    platform::mmap_sync(mmap_, PAGE_SIZE);
 
     // 1. Create the node (vector + text + node struct)
     uint64_t new_offset = create_node(id, embedding, text);
@@ -585,7 +621,7 @@ uint64_t KVEngine::insert(uint64_t id, const std::vector<float>& embedding,
         header->flags &= ~FLAG_WRITE_IN_PROGRESS;
         checkpoint_header();
         update_header_checksum();
-        msync(map_base, PAGE_SIZE, MS_SYNC);
+        platform::mmap_sync(mmap_, PAGE_SIZE);
 
         return new_offset;
     }
@@ -613,6 +649,14 @@ uint64_t KVEngine::insert(uint64_t id, const std::vector<float>& embedding,
         // Search for ef_construction nearest neighbors at this layer
         auto candidates = search_layer(q, dim, current_ep, lc, ef);
         
+        // If no live nodes found at layer 0, the index is effectively empty
+        // (all reachable nodes are deleted). Promote this node to entry point.
+        if (candidates.empty() && lc == 0) {
+            header->hnsw_entry_point.store(new_offset);
+            header->hnsw_max_level.store(new_level);
+            break;
+        }
+
         // Select M best neighbors
         auto neighbors = select_neighbors(candidates, M);
         
@@ -640,7 +684,289 @@ uint64_t KVEngine::insert(uint64_t id, const std::vector<float>& embedding,
     header->flags &= ~FLAG_WRITE_IN_PROGRESS;
     checkpoint_header();
     update_header_checksum();
-    msync(map_base, PAGE_SIZE, MS_SYNC);
+    platform::mmap_sync(mmap_, PAGE_SIZE);
 
     return new_offset;
+}
+
+// =============================================================================
+// Batch Insert — N vectors in one lock acquisition
+// =============================================================================
+std::vector<uint64_t> KVEngine::insert_batch(
+    const uint64_t* ids, const float* data, uint32_t n, uint32_t dim,
+    const std::vector<std::string>& texts)
+{
+    WriteGuard wg(rwlock_);
+
+    checkpoint_header();
+    header->flags |= FLAG_WRITE_IN_PROGRESS;
+    platform::mmap_sync(mmap_, PAGE_SIZE);
+
+    std::vector<uint64_t> offsets;
+    offsets.reserve(n);
+
+    for (uint32_t idx = 0; idx < n; ++idx) {
+        // Build embedding vector from contiguous float array
+        std::vector<float> embedding(data + idx * dim, data + (idx + 1) * dim);
+        const std::string& text = (idx < texts.size()) ? texts[idx] : "";
+
+        // --- Inline insert logic (same as insert() without lock) ---
+        uint64_t new_offset = create_node(ids[idx], embedding, text);
+        Node* new_node = get_ptr<Node>(new_offset);
+        int new_level = get_random_level();
+
+        uint64_t hnsw_size = sizeof(HNSWNodeData) + (new_level + 1) * sizeof(uint64_t);
+        uint64_t hnsw_offset = allocate(hnsw_size, 8);
+        HNSWNodeData* new_hnsw = get_ptr<HNSWNodeData>(hnsw_offset);
+        new_hnsw->level = new_level;
+        for (int i = 0; i <= new_level; i++) {
+            new_hnsw->layer_offsets[i] = NULL_OFFSET;
+        }
+        new_node->hnsw_head.store(hnsw_offset);
+
+        VectorBlock* new_vb = get_ptr<VectorBlock>(new_node->vector_head);
+        const float* q = new_vb->data;
+
+        uint64_t ep = header->hnsw_entry_point.load();
+        int current_max_level = header->hnsw_max_level.load();
+
+        if (ep == NULL_OFFSET || current_max_level < 0) {
+            header->hnsw_entry_point.store(new_offset);
+            header->hnsw_max_level.store(new_level);
+            offsets.push_back(new_offset);
+            continue;
+        }
+
+        uint64_t current_ep = ep;
+        for (int lc = current_max_level; lc > new_level; --lc) {
+            auto layer_result = search_layer(q, dim, current_ep, lc, 1);
+            if (!layer_result.empty()) current_ep = layer_result[0].second;
+        }
+
+        int connect_top = std::min(new_level, current_max_level);
+        int M = header->M_max;
+        int ef = header->ef_construction;
+
+        for (int lc = connect_top; lc >= 0; --lc) {
+            auto candidates = search_layer(q, dim, current_ep, lc, ef);
+            if (candidates.empty() && lc == 0) {
+                header->hnsw_entry_point.store(new_offset);
+                header->hnsw_max_level.store(new_level);
+                break;
+            }
+            auto neighbors = select_neighbors(candidates, M);
+            for (auto& [dist, neighbor_offset] : neighbors) {
+                add_hnsw_link(new_offset, lc, neighbor_offset, dist);
+                add_hnsw_link(neighbor_offset, lc, new_offset, dist);
+            }
+            if (!candidates.empty()) current_ep = candidates[0].second;
+        }
+
+        if (new_level > current_max_level) {
+            header->hnsw_max_level.store(new_level);
+            header->hnsw_entry_point.store(new_offset);
+        }
+
+        offsets.push_back(new_offset);
+    }
+
+    header->flags &= ~FLAG_WRITE_IN_PROGRESS;
+    checkpoint_header();
+    update_header_checksum();
+    platform::mmap_sync(mmap_, PAGE_SIZE);
+
+    return offsets;
+}
+
+// =============================================================================
+// Delete Node (Tombstone)
+// =============================================================================
+void KVEngine::delete_node(uint64_t node_offset) {
+    WriteGuard wg(rwlock_);
+    Node* node = get_ptr<Node>(node_offset);
+    if (!node) throw std::runtime_error("Invalid node offset");
+    if (node->node_flags.load() & NODE_DELETED) return; // already deleted
+    node->node_flags.fetch_or(NODE_DELETED);
+    header->deleted_count.fetch_add(1);
+}
+
+bool KVEngine::is_deleted(uint64_t node_offset) {
+    Node* node = get_ptr<Node>(node_offset);
+    if (!node) return true;
+    return (node->node_flags.load() & NODE_DELETED) != 0;
+}
+
+// =============================================================================
+// Update Node = tombstone old + insert new
+// =============================================================================
+uint64_t KVEngine::update_node(uint64_t old_offset, uint64_t new_id,
+                               const std::vector<float>& embedding,
+                               const std::string& text) {
+    // Tombstone old node (acquires write lock internally)
+    delete_node(old_offset);
+    // Insert new node (acquires write lock internally)
+    return insert(new_id, embedding, text);
+}
+
+// =============================================================================
+// Metadata: Set key=value on a node (COW linked list)
+// =============================================================================
+void KVEngine::set_metadata(uint64_t node_offset, const std::string& key,
+                            const std::string& value) {
+    WriteGuard wg(rwlock_);
+    Node* node = get_ptr<Node>(node_offset);
+    if (!node) throw std::runtime_error("Invalid node offset");
+
+    // Allocate new MetadataEntry
+    uint64_t entry_size = sizeof(MetadataEntry) + key.size() + value.size();
+    uint64_t entry_offset = allocate(entry_size, 8);
+    MetadataEntry* entry = get_ptr<MetadataEntry>(entry_offset);
+    
+    entry->key_len = static_cast<uint32_t>(key.size());
+    entry->val_len = static_cast<uint32_t>(value.size());
+    // Prepend to existing metadata list
+    entry->next = node->metadata_offset;
+    // Copy key then value into data[]
+    std::memcpy(entry->data, key.data(), key.size());
+    std::memcpy(entry->data + key.size(), value.data(), value.size());
+
+    node->metadata_offset = entry_offset;
+}
+
+// =============================================================================
+// Metadata: Get value for a key (walks linked list, returns first match)
+// =============================================================================
+std::string KVEngine::get_metadata(uint64_t node_offset, const std::string& key) {
+    ReadGuard rg(rwlock_);
+    Node* node = get_ptr<Node>(node_offset);
+    if (!node) return "";
+
+    uint64_t cur = node->metadata_offset;
+    while (cur != NULL_OFFSET) {
+        MetadataEntry* entry = get_ptr<MetadataEntry>(cur);
+        if (entry->key_len == key.size() &&
+            std::memcmp(entry->data, key.data(), key.size()) == 0) {
+            return std::string(entry->data + entry->key_len, entry->val_len);
+        }
+        cur = entry->next;
+    }
+    return "";
+}
+
+// =============================================================================
+// Metadata: Get all key=value pairs
+// =============================================================================
+std::vector<std::pair<std::string, std::string>>
+KVEngine::get_all_metadata(uint64_t node_offset) {
+    ReadGuard rg(rwlock_);
+    Node* node = get_ptr<Node>(node_offset);
+    std::vector<std::pair<std::string, std::string>> result;
+    if (!node) return result;
+
+    // Walk linked list, collect unique keys (first occurrence wins)
+    std::unordered_set<std::string> seen;
+    uint64_t cur = node->metadata_offset;
+    while (cur != NULL_OFFSET) {
+        MetadataEntry* entry = get_ptr<MetadataEntry>(cur);
+        std::string k(entry->data, entry->key_len);
+        if (seen.find(k) == seen.end()) {
+            seen.insert(k);
+            std::string v(entry->data + entry->key_len, entry->val_len);
+            result.push_back({k, v});
+        }
+        cur = entry->next;
+    }
+    return result;
+}
+
+// =============================================================================
+// Metadata Filter Check: does a node pass all filters?
+// =============================================================================
+bool KVEngine::passes_filters(uint64_t node_offset,
+                              const std::vector<MetadataFilter>& filters) {
+    if (filters.empty()) return true;
+    Node* node = get_ptr<Node>(node_offset);
+    if (!node) return false;
+
+    for (const auto& f : filters) {
+        bool found = false;
+        uint64_t cur = node->metadata_offset;
+        while (cur != NULL_OFFSET) {
+            MetadataEntry* entry = get_ptr<MetadataEntry>(cur);
+            if (entry->key_len == f.key.size() &&
+                std::memcmp(entry->data, f.key.data(), f.key.size()) == 0) {
+                // Key matches — check value
+                if (entry->val_len == f.value.size() &&
+                    std::memcmp(entry->data + entry->key_len,
+                                f.value.data(), f.value.size()) == 0) {
+                    found = true;
+                }
+                break; // first occurrence of key is authoritative
+            }
+            cur = entry->next;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+// =============================================================================
+// Filtered K-NN Search — same as search_knn but with post-filter
+// Uses larger internal ef to compensate for filtered-out nodes.
+// =============================================================================
+std::vector<std::pair<uint64_t, float>> KVEngine::search_knn_filtered(
+    const float* query, uint32_t dim, int k, int ef_search,
+    const std::vector<MetadataFilter>& filters)
+{
+    ReadGuard rg(rwlock_);
+
+    uint64_t ep = header->hnsw_entry_point.load();
+    int max_level = header->hnsw_max_level.load();
+    if (ep == NULL_OFFSET || max_level < 0) return {};
+
+    // Greedy descent layers > 0
+    uint64_t current_ep = ep;
+    for (int lc = max_level; lc >= 1; --lc) {
+        auto layer_result = search_layer(query, dim, current_ep, lc, 1);
+        if (!layer_result.empty()) current_ep = layer_result[0].second;
+    }
+
+    // Use larger ef to allow for filter loss (at least 4x k)
+    int expanded_ef = std::max(ef_search, k * 4);
+    auto layer0_result = search_layer(query, dim, current_ep, 0, expanded_ef);
+
+    // Post-filter: keep only nodes passing all metadata filters
+    std::vector<std::pair<uint64_t, float>> knn;
+    for (auto& [dist, offset] : layer0_result) {
+        if (passes_filters(offset, filters)) {
+            knn.push_back({offset, dist});
+            if ((int)knn.size() >= k) break;
+        }
+    }
+    return knn;
+}
+
+// =============================================================================
+// Count / Iteration
+// =============================================================================
+uint64_t KVEngine::count() const {
+    return header->node_count.load() - header->deleted_count.load();
+}
+
+uint64_t KVEngine::total_count() const {
+    return header->node_count.load();
+}
+
+std::vector<uint64_t> KVEngine::get_all_node_offsets() {
+    ReadGuard rg(rwlock_);
+    std::vector<uint64_t> offsets;
+    uint64_t cur = header->first_node_offset.load();
+    while (cur != NULL_OFFSET) {
+        Node* node = get_ptr<Node>(cur);
+        if (node && !(node->node_flags.load() & NODE_DELETED)) {
+            offsets.push_back(cur);
+        }
+        cur = node->next_node_offset;
+    }
+    return offsets;
 }

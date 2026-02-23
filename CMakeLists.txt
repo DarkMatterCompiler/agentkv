@@ -14,11 +14,11 @@ nanobind_add_module(agentkv_core
     src/slb.cpp
 )
 
-# 4. Compiler Flags for Performance
+# 4. Compiler Flags for Performance + SIMD
 if(MSVC)
-    target_compile_options(agentkv_core PRIVATE /O2 /std:c++20)
+    target_compile_options(agentkv_core PRIVATE /O2 /std:c++20 /arch:AVX2)
 else()
-    target_compile_options(agentkv_core PRIVATE -O3 -std=c++20 -fPIC -march=native)
+    target_compile_options(agentkv_core PRIVATE -O3 -std=c++20 -fPIC -march=native -mavx2 -mfma)
     target_link_libraries(agentkv_core PRIVATE pthread)
 endif()
 
