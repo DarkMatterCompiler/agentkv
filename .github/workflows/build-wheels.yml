@@ -28,7 +28,9 @@ jobs:
 
       - name: Build wheels
         env:
-          CIBW_ARCHS: "x86_64"
+          # Restrict Linux builds to x86_64. Do not set CIBW_ARCHS globally
+          # because Windows expects different architecture names (AMD64/x86).
+          CIBW_ARCHS_LINUX: "x86_64"
         run: cibuildwheel --output-dir wheelhouse
 
       - uses: actions/upload-artifact@v4
