@@ -110,17 +110,21 @@ See the [examples/](examples/) directory:
 ```
 Python Agent / LangGraph
         |
-  agentkv.AgentKV  (High-Level API)
+  agentkv.AgentKV  (High-level Python API)
         |
-  agentkv_core.so  (nanobind, zero-copy, GIL-free)
+  agentkv_core  (nanobind C++ extension — zero-copy, GIL-free)
         |
   C++ Engine
-  +-- mmap Storage (single file)
-  +-- HNSW Index (vector search)
-  +-- Property Graph (relationships)
-  +-- String Arena (text persistence)
-  +-- Crash Recovery (CRC + rollback)
-  +-- SLB (predictive context)
+  +-- mmap Storage (single-file persistence, string arena for text + metadata)
+  +-- Metadata Store (key/value tags, efficient multi-key filters)
+  +-- HNSW Index (vector search) — SIMD-accelerated distance kernels (SSE/AVX2)
+  +-- Distance Metrics: Cosine, L2, Inner-Product (selectable)
+  +-- Batch Insert / WriteGuard (atomic bulk insert; serialized writers)
+  +-- Property Graph (directed edges) + SLB (predictive context)
+  +-- Tombstone + Update model (delete=tombstone + re-insert)
+  +-- Crash Recovery (CRC checksums, header rollback)
+  +-- Thread-safety (GIL released during search; reader-friendly; concurrent writers serialized)
+  +-- Platform helpers (`mmap_platform.h`, `simd.h`) — cross-platform (Linux/macOS/Windows)
 ```
 
 ---
