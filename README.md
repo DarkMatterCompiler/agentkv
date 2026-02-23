@@ -26,6 +26,53 @@ print(db.get_text(results[0][0]))  # "Paris is the capital of France"
 
 ---
 
+## What's New in v0.9.0
+
+- **SIMD distance (AVX2):** SIMD-accelerated distance computation on supported platforms to improve search throughput.
+- **Multiple metrics:** `cosine` and `l2` both supported and validated.
+- **Batch insert:** `add_batch` supports bulk inserts (example usage: insert 100 nodes in one call).
+- **Metadata filtering:** Search with `where={'color':'red'}` filters results by metadata tags.
+- **Delete / Update:** Tombstone + re-insert workflow; deletes decrement the count.
+- **Count / Iteration:** `len(db)`, `db.keys()`, `db.items()`, `get_all_metadata(offset)` supported.
+- **Windows support:** Native Windows wheels produced; CI includes Windows builds.
+
+## API Highlights
+
+- `AgentKV(path, size_mb=100, dim=1536, metric="cosine")` — create/open DB
+- `add(text, vector, relations=None, metadata=None) -> offset`
+- `add_batch(contents, vectors, metadatas=None) -> List[offsets]`
+- `search(query_vector, k=5, ef_search=50, where=None)` — `where` is metadata filter
+- `delete(offset)`, `update(old_offset, content, vector, metadata=None)`
+- `len(db)`, `db.keys()`, `db.items()`, `get_vector(offset)`, `get_text(offset)`, `get_all_metadata(offset)`
+- Context helpers: `observe(node_id)`, `build_context(node_offsets, max_tokens=2048)`
+
+## Example (using new features)
+
+```python
+import numpy as np
+from agentkv import AgentKV
+
+db = AgentKV("demo.db", size_mb=10, dim=128, metric="l2")
+
+# Batch insert 100 random vectors with metadata
+texts = [f"item-{i}" for i in range(100)]
+vecs = np.random.rand(100, 128).astype(np.float32)
+metas = [{"color": "red" if i % 2 == 0 else "blue"} for i in range(100)]
+offsets = db.add_batch(texts, vecs, metadatas=metas)
+
+# Search only red items
+q = np.random.rand(128).astype(np.float32)
+results = db.search(q, k=5, where={"color": "red"})
+
+# Delete + update
+db.delete(offsets[0])
+new_offset = db.update(offsets[1], "updated text", vecs[1], metadata={"color":"green"})
+
+print(len(db), db.keys(), db.get_all_metadata(new_offset))
+```
+
+---
+
 ## Why AgentKV?
 
 | Problem | AgentKV Solution |
