@@ -15,7 +15,6 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-          - os: macos-13
           - os: windows-2022
 
     steps:
@@ -31,12 +30,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install cibuildwheel==2.21.3 scikit-build-core nanobind numpy wheel setuptools cmake
 
-      - name: Install macOS build tools
-        if: runner.os == 'macOS'
-        run: |
-          brew update
-          brew install ninja || true
-
       - name: Build wheels
         env:
           # Restrict Linux builds to x86_64. Do not set CIBW_ARCHS globally
@@ -44,8 +37,6 @@ jobs:
           CIBW_ARCHS_LINUX: "x86_64"
           # Increase verbosity to surface underlying build failures in logs
           CIBW_BUILD_VERBOSITY: "2"
-          # Force macOS builds to x86_64 (we only support Intel macOS currently)
-          CIBW_ARCHS_MACOS: "x86_64"
         run: cibuildwheel --output-dir wheelhouse
 
       - uses: actions/upload-artifact@v4
